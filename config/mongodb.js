@@ -1,27 +1,22 @@
 const mongoose = require('mongoose');
+const logger = require('../logger');
 
-// MongoDB connection URI
-// Default: local MongoDB instance
-// You can change this to MongoDB Atlas or any other MongoDB instance
+// MongoDB connection URI — provided via the environment (see .env.example).
+// Falls back to a local instance for non-containerized development only.
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/cylinder_management';
 
 // Connect to MongoDB
 const connectDB = async () => {
   try {
     await mongoose.connect(MONGODB_URI);
-    
-    console.log('✅ MongoDB connected successfully');
-    console.log(`📁 Database: ${mongoose.connection.name}`);
-    console.log(`🌐 Host: ${mongoose.connection.host}`);
-    
+
+    logger.info(`MongoDB connected (db: ${mongoose.connection.name}, host: ${mongoose.connection.host})`);
+
     // Initialize default data
     await initializeDefaultData();
-    
+
   } catch (error) {
-    console.error('❌ MongoDB connection error:', error.message);
-    console.log('\n📝 Make sure MongoDB is running on your system.');
-    console.log('   Install: https://www.mongodb.com/docs/manual/installation/');
-    console.log('   Or use MongoDB Atlas (cloud): https://www.mongodb.com/cloud/atlas');
+    logger.error('MongoDB connection error: ' + error.message);
     process.exit(1);
   }
 };
@@ -30,60 +25,53 @@ const connectDB = async () => {
 const initializeDefaultData = async () => {
   const GasType = require('../models/GasType');
   const CylinderSize = require('../models/CylinderSize');
-  
+  const GasCapacity = require('../models/GasCapacity');
+
   try {
-    // Add default gas types
-    const gasTypes = [
-      'Medical Oxygen',
-      'Industrial Oxygen',
-      'Nitrogen',
-      'CO2',
-      'Argon'
-    ];
-    
-    for (const gasType of gasTypes) {
+    // Static config seeds the catalog on first run only (Phase 10): the GasCapacity
+    // collection is the runtime source of truth afterwards, managed from Profile.
+    const { GAS_CAPACITIES } = require('./gasCapacities');
+
+    for (const gasType of Object.keys(GAS_CAPACITIES)) {
       await GasType.findOneAndUpdate(
         { gas_type_name: gasType },
-        { gas_type_name: gasType, is_active: true },
+        { $setOnInsert: { gas_type_name: gasType, is_active: true } },
         { upsert: true, new: true }
       );
+      await GasCapacity.updateOne(
+        { gas_type_name: gasType },
+        { $setOnInsert: { gas_type_name: gasType, sizes: GAS_CAPACITIES[gasType] } },
+        { upsert: true }
+      );
     }
-    
-    // Add default cylinder sizes
-    const sizes = ['1.5mm', '7mm', '10mm'];
-    
+
+    // Prune ONLY the known-legacy names (the old Oxygen split) — never user-added gas
+    // types: the catalog is user-managed now (Phase 10).
+    await GasType.deleteMany({ gas_type_name: { $in: ['Industrial Oxygen', 'Medical Oxygen'] } });
+
+    // All distinct capacities across every gas type
+    const sizes = [...new Set(Object.values(GAS_CAPACITIES).flat())];
+
     for (const size of sizes) {
       await CylinderSize.findOneAndUpdate(
         { size_label: size },
-        { size_label: size, is_active: true },
+        { $setOnInsert: { size_label: size, is_active: true } },
         { upsert: true, new: true }
       );
     }
-    
-    console.log('✅ Default data initialized');
+
+    logger.info('Default data initialized (gas types & cylinder sizes)');
   } catch (error) {
-    console.error('Error initializing default data:', error.message);
+    logger.error('Error initializing default data: ' + error.message);
   }
 };
 
-// Handle connection events
-mongoose.connection.on('connected', () => {
-  console.log('📡 Mongoose connected to MongoDB');
-});
-
+// Connection lifecycle logging (shutdown is handled centrally in server.js).
 mongoose.connection.on('error', (err) => {
-  console.error('Mongoose connection error:', err);
+  logger.error('Mongoose connection error: ' + err.message);
 });
-
 mongoose.connection.on('disconnected', () => {
-  console.log('Mongoose disconnected from MongoDB');
-});
-
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  await mongoose.connection.close();
-  console.log('MongoDB connection closed through app termination');
-  process.exit(0);
+  logger.warn('Mongoose disconnected from MongoDB');
 });
 
 module.exports = connectDB;
