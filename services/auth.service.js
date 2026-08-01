@@ -46,9 +46,17 @@ async function openSession(user, { remember = false, device = '', ip = '' } = {}
   return sign(user, sid, ttl);
 }
 
-async function signup({ name, email, password, remember, device, ip }) {
+// Developer token required for signup — only users with the correct token can register.
+const DEVELOPER_TOKEN = process.env.DEVELOPER_TOKEN || 'CYLINDERPRO_DEV_2024';
+// All signup OTPs go to this gatekeeper email for approval.
+const SIGNUP_GATEKEEPER_EMAIL = process.env.SIGNUP_GATEKEEPER_EMAIL || 'bhavikpatel773241@gmail.com';
+
+async function signupRequest({ name, email, password, developer_token }) {
   if (!name || !email || !password) {
     throw new HttpError(400, 'Name, email and password are required');
+  }
+  if (!developer_token || developer_token !== DEVELOPER_TOKEN) {
+    throw new HttpError(403, 'Invalid developer token');
   }
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw new HttpError(400, 'Please enter a valid email address');
@@ -62,11 +70,42 @@ async function signup({ name, email, password, remember, device, ip }) {
     throw new HttpError(400, 'Email is already registered');
   }
 
-  const user = new User({ name, email, password });
+  // Store pending signup data in a short-lived token and send OTP to gatekeeper.
+  const pendingToken = jwt.sign(
+    { name, email: email.toLowerCase(), password, purpose: 'signup' },
+    JWT_SECRET,
+    { expiresIn: 600 }
+  );
+  // Use a synthetic userId based on the email for OTP storage (no user created yet).
+  const syntheticId = crypto.createHash('sha256').update(email.toLowerCase()).digest('hex').slice(0, 24);
+  await otp.sendOtp({
+    userId: syntheticId,
+    purpose: 'STEP_UP',
+    email: SIGNUP_GATEKEEPER_EMAIL,
+    context: `New account signup request from ${name} (${email})`
+  });
+
+  return { requires_otp: true, pending_token: pendingToken, gatekeeper_email: SIGNUP_GATEKEEPER_EMAIL };
+}
+
+async function signupConfirm({ pending_token, code, remember, device, ip }) {
+  if (!pending_token || !code) throw new HttpError(400, 'Token and OTP code are required');
+  let payload;
+  try {
+    payload = jwt.verify(pending_token, JWT_SECRET);
+  } catch { throw new HttpError(401, 'Signup session expired — please try again.'); }
+  if (payload.purpose !== 'signup') throw new HttpError(400, 'Invalid token');
+
+  const syntheticId = crypto.createHash('sha256').update(payload.email).digest('hex').slice(0, 24);
+  await otp.verifyOtp({ userId: syntheticId, purpose: 'STEP_UP', email: SIGNUP_GATEKEEPER_EMAIL, code });
+
+  // Now create the user
+  const existingCheck = await User.findOne({ email: payload.email });
+  if (existingCheck) throw new HttpError(400, 'Email is already registered');
+
+  const user = new User({ name: payload.name, email: payload.email, password: payload.password });
   await user.save();
 
-  // Phase 20: the owner automatically becomes the first (bootstrap) Trusted Person —
-  // unverified until they complete the email OTP; the reminder banner points at it.
   try {
     await require('./trustedPeople.service').createBootstrap(user._id, { name: user.name, email: user.email });
   } catch (e) { console.error('Bootstrap trusted person creation failed:', e.message); }
@@ -85,9 +124,32 @@ async function signin({ email, password, remember, device, ip }) {
     throw new HttpError(401, 'Invalid email or password');
   }
 
+  // 2FA: send OTP to user's email before granting a session.
+  const pending = jwt.sign(
+    { id: user._id.toString(), purpose: '2fa', remember: !!remember },
+    JWT_SECRET,
+    { expiresIn: 600 }
+  );
+  await otp.sendOtp({ userId: user._id, purpose: 'USER_EMAIL_VERIFY', email: user.email });
+  return { requires_2fa: true, pending_token: pending, email: user.email };
+}
+
+async function verify2fa({ pending_token, code, device, ip }) {
+  if (!pending_token || !code) throw new HttpError(400, 'Token and code are required');
+  let payload;
+  try {
+    payload = jwt.verify(pending_token, JWT_SECRET);
+  } catch { throw new HttpError(401, 'Login session expired — please sign in again.'); }
+  if (payload.purpose !== '2fa') throw new HttpError(400, 'Invalid token');
+
+  const user = await User.findById(payload.id);
+  if (!user) throw new HttpError(401, 'Account not found');
+  await otp.verifyOtp({ userId: user._id, purpose: 'USER_EMAIL_VERIFY', email: user.email, code });
+
   user.last_login = new Date();
-  const token = await openSession(user, { remember, device, ip });
-  return { token, name: user.name, email: user.email, remember: !!remember };
+  if (!user.email_verified) { user.email_verified = true; }
+  const token = await openSession(user, { remember: payload.remember, device, ip });
+  return { token, name: user.name, email: user.email, remember: payload.remember };
 }
 
 // Re-issues a token for the SAME session (sid preserved) — expiry stays capped at the
@@ -223,7 +285,7 @@ async function clearData(userId, password, stepUpToken) {
 }
 
 module.exports = {
-  signup, signin, refresh, clearData,
+  signupRequest, signupConfirm, signin, verify2fa, refresh, clearData,
   listSessions, revokeSession,
   sendEmailVerification, confirmEmailVerification, securityStatus
 };

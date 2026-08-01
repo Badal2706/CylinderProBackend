@@ -8,11 +8,19 @@ const deviceMeta = (req) => ({
 });
 
 exports.signup = asyncHandler(async (req, res) => {
-  res.json(await authService.signup({ ...req.body, ...deviceMeta(req) }));
+  res.json(await authService.signupRequest(req.body));
+});
+
+exports.signupConfirm = asyncHandler(async (req, res) => {
+  res.json(await authService.signupConfirm({ ...req.body, ...deviceMeta(req) }));
 });
 
 exports.signin = asyncHandler(async (req, res) => {
   res.json(await authService.signin({ ...req.body, ...deviceMeta(req) }));
+});
+
+exports.verify2fa = asyncHandler(async (req, res) => {
+  res.json(await authService.verify2fa({ ...req.body, ...deviceMeta(req) }));
 });
 
 exports.refresh = asyncHandler(async (req, res) => {

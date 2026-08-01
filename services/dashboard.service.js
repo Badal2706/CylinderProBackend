@@ -54,12 +54,13 @@ async function getStats(uid) {
 }
 
 async function getCylinderStock(uid) {
-  const [totalCylinders, cylindersAtPlant, cylindersInRotation, perLocation] = await Promise.all([
+  const [totalCylinders, cylindersAtPlant, cylindersInRotation, maintenanceCount, perLocation] = await Promise.all([
     Cylinder.countDocuments({ user_id: uid }),
-    Cylinder.countDocuments({ user_id: uid, stock_state: 'IN_STOCK' }),
+    Cylinder.countDocuments({ user_id: uid, stock_state: 'IN_STOCK', under_maintenance: { $ne: true } }),
     Cylinder.countDocuments({ user_id: uid, stock_state: 'AT_CUSTOMER' }),
+    Cylinder.countDocuments({ user_id: uid, under_maintenance: true }),
     Cylinder.aggregate([
-      { $match: { user_id: toOid(uid), stock_state: 'IN_STOCK' } },
+      { $match: { user_id: toOid(uid), stock_state: 'IN_STOCK', under_maintenance: { $ne: true } } },
       { $group: { _id: '$location', count: { $sum: 1 } } }
     ])
   ]);
@@ -67,7 +68,7 @@ async function getCylinderStock(uid) {
   const byLocation = {};
   perLocation.forEach(r => { byLocation[r._id] = r.count; });
 
-  return { totalCylinders, cylindersInRotation, cylindersAtPlant, byLocation };
+  return { totalCylinders, cylindersInRotation, cylindersAtPlant, maintenanceCount, byLocation };
 }
 
 async function getOverLimitCustomers(uid) {
