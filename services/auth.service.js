@@ -47,9 +47,13 @@ async function openSession(user, { remember = false, device = '', ip = '' } = {}
 }
 
 // Developer token required for signup — only users with the correct token can register.
-const DEVELOPER_TOKEN = process.env.DEVELOPER_TOKEN || 'CYLINDERPRO_DEV_2024';
 // All signup OTPs go to this gatekeeper email for approval.
-const SIGNUP_GATEKEEPER_EMAIL = process.env.SIGNUP_GATEKEEPER_EMAIL || 'bhavikpatel773241@gmail.com';
+const DEVELOPER_TOKEN = process.env.DEVELOPER_TOKEN;
+const SIGNUP_GATEKEEPER_EMAIL = process.env.SIGNUP_GATEKEEPER_EMAIL;
+
+if (process.env.NODE_ENV === 'production' && (!DEVELOPER_TOKEN || !SIGNUP_GATEKEEPER_EMAIL)) {
+  throw new Error('DEVELOPER_TOKEN and SIGNUP_GATEKEEPER_EMAIL must be set in production');
+}
 
 async function signupRequest({ name, email, password, developer_token }) {
   if (!name || !email || !password) {
