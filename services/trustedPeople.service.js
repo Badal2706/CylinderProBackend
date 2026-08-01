@@ -142,6 +142,9 @@ async function syncBootstrap(userId, { name, email }) {
     if (dup) throw new HttpError(400, `${clean} already belongs to another trusted person — remove them first or use a different email.`);
     boot.email = clean;
     boot.email_verified = false;
+    boot.totp_secret = '';
+    boot.totp_enabled = false;
+    boot.is_active = false;
   }
   await boot.save();
   return boot;

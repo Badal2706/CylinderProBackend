@@ -4,7 +4,9 @@ const authMiddleware = require('../middleware/auth');
 const ctrl = require('../controllers/auth.controller');
 
 router.post('/signup', ctrl.signup);
+router.post('/signup/confirm', ctrl.signupConfirm);
 router.post('/signin', ctrl.signin);
+router.post('/signin/verify-2fa', ctrl.verify2fa);
 router.post('/refresh', authMiddleware, ctrl.refresh);
 router.post('/clear-data', authMiddleware, ctrl.clearData);
 

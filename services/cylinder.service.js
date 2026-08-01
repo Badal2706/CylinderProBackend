@@ -165,7 +165,8 @@ async function listCylinders(uid, { search, stock_state, location, state, page, 
     and.push({ $or: [
       { rotational_number: re },
       { physical_number: re },
-      { gas_type: re }
+      { gas_type: re },
+      { capacity: re }
     ] });
   }
 
@@ -258,7 +259,7 @@ function translateDuplicateKeyError(error) {
   return null;
 }
 
-async function createCylinder(uid, { rotational_number, physical_number, gas_type, capacity, location, stock_state }) {
+async function createCylinder(uid, { rotational_number, physical_number, gas_type, capacity, location, stock_state, under_maintenance }) {
   if (!rotational_number || !gas_type || !capacity) {
     throw new HttpError(400, 'Rotational number, gas type, and capacity are all required');
   }
@@ -266,12 +267,13 @@ async function createCylinder(uid, { rotational_number, physical_number, gas_typ
   const cylinder = new Cylinder({
     user_id: uid,
     rotational_number,
-    // physical_number is optional; store undefined when blank so the partial unique index ignores it
     physical_number: (physical_number && physical_number.trim()) ? physical_number.trim() : undefined,
     gas_type,
     capacity,
     location: normalizeLocation(location) || 'AT_PLANT_CHANDISAR',
-    stock_state: normalizeStockState(stock_state) || 'IN_STOCK'
+    stock_state: normalizeStockState(stock_state) || 'IN_STOCK',
+    under_maintenance: !!under_maintenance,
+    maintenance_since: under_maintenance ? new Date() : null
   });
 
   try {
@@ -350,7 +352,7 @@ async function importCylinders(uid, rows) {
 }
 
 async function updateCylinder(uid, id, body) {
-  const allowed = ['rotational_number', 'physical_number', 'gas_type', 'capacity', 'location', 'stock_state'];
+  const allowed = ['rotational_number', 'physical_number', 'gas_type', 'capacity', 'location', 'stock_state', 'under_maintenance'];
   const updates = {};
   const unset = {};
   allowed.forEach(field => {
@@ -362,6 +364,10 @@ async function updateCylinder(uid, id, body) {
     unset.physical_number = '';
   } else if (updates.physical_number !== undefined) {
     updates.physical_number = String(updates.physical_number).trim();
+  }
+  if (updates.under_maintenance !== undefined) {
+    updates.under_maintenance = !!updates.under_maintenance;
+    updates.maintenance_since = updates.under_maintenance ? new Date() : null;
   }
   const mutation = Object.keys(unset).length ? { $set: updates, $unset: unset } : updates;
 
