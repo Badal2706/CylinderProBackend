@@ -1,30 +1,31 @@
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
+// Outbound email (Phase 17). Uses Resend's API — required because this Droplet's
+// provider blocks outbound SMTP ports (465/587) at the network level; see DigitalOcean
+// ticket #12627478. Domain guruindustries.co.in is verified with Resend as of 2026-07-30.
+// Configured via RESEND_API_KEY and RESEND_FROM in the environment.
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
-// Outbound email (Phase 17). Configured entirely via environment:
-//   SMTP_HOST, SMTP_PORT (default 587), SMTP_USER, SMTP_PASS, SMTP_FROM
-// Without SMTP_HOST there is NO transport (typical local dev) — sendMail then logs the
-// message to the server console and reports { sent: false } so callers can fall back to
-// a dev-mode code reveal. Never enable that fallback path in production.
-let transport = null;
-if (process.env.SMTP_HOST) {
-  transport = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: Number(process.env.SMTP_PORT || 587) === 465,
-    auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined
-  });
+function isConfigured() {
+  return !!resend;
 }
 
 async function sendMail({ to, subject, text }) {
-  if (!transport) {
-    console.log(`[DEV MAIL — SMTP not configured] To: ${to} | ${subject} | ${text}`);
+  if (!resend) {
+    console.log(`[DEV MAIL — RESEND_API_KEY not configured] To: ${to} | ${subject} | ${text}`);
     return { sent: false };
   }
-  await transport.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to, subject, text
-  });
-  return { sent: true };
+  try {
+    await resend.emails.send({
+      from: process.env.RESEND_FROM || 'otp@guruindustries.co.in',
+      to,
+      subject,
+      text,
+    });
+    return { sent: true };
+  } catch (err) {
+    console.error(`OTP email to ${to} failed (${err.message})`);
+    return { sent: false };
+  }
 }
 
-module.exports = { sendMail, isConfigured: () => !!transport };
+module.exports = { sendMail, isConfigured };

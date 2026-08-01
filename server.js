@@ -1,4 +1,5 @@
 // Load environment variables FIRST, before anything else reads process.env.
+require('dns').setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 const express = require('express');
@@ -40,7 +41,7 @@ const allowedOrigins = (process.env.FRONTEND_ORIGIN ||
 app.use(cors({
   origin: (origin, cb) => {
     // Allow same-origin / non-browser tools (no Origin header) and any allowed origin.
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    if (!origin || allowedOrigins.includes(origin) || /^https:\/\/([a-z0-9]+\.)?cylinderprofrontend\.pages\.dev$/.test(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
   credentials: true
