@@ -1,9 +1,17 @@
 const jwt = require('jsonwebtoken');
 const archiverLib = require('archiver');
-// archiver v8 exports named members ({ Archiver, create, ... }); older versions export a
-// callable function. Support both so the ZIP export works regardless of installed version.
-const createArchive = (opts) =>
-  (typeof archiverLib === 'function' ? archiverLib('zip', opts) : archiverLib.create('zip', opts));
+// Create a zip Archiver across archiver major versions. v7 and earlier export a callable factory
+// (`archiver('zip', opts)`). v8 is ESM-first and, under CommonJS require(), yields a namespace
+// object `{ Archiver, JsonArchive, TarArchive, ZipArchive }` — NOT callable and with no `.create`
+// (the previous code assumed a `.create` that never existed, which is what threw
+// "archiverLib.create is not a function"). For v8 the archive is built with `new Archiver('zip')`.
+const createArchive = (opts) => {
+  if (typeof archiverLib === 'function') return archiverLib('zip', opts);                 // v7 and earlier
+  if (archiverLib && typeof archiverLib.Archiver === 'function') return new archiverLib.Archiver('zip', opts); // v8
+  if (archiverLib && typeof archiverLib.default === 'function') return archiverLib.default('zip', opts);       // esm interop
+  if (archiverLib && typeof archiverLib.create === 'function') return archiverLib.create('zip', opts);         // just in case
+  throw new Error('Unsupported "archiver" version: no known way to create a zip archive.');
+};
 const XLSX = require('xlsx');
 const User = require('../models/User');
 const BusinessProfile = require('../models/BusinessProfile');
