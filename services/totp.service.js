@@ -58,4 +58,66 @@ async function validateAny(userId, code) {
   return null;
 }
 
-module.exports = { startEnrollment, confirmEnrollment, validateAny };
+// ─── Phase 25: rotation triggered by an account email change ───
+// Called from profile.updateAccount. Rotates the bootstrap person (the account owner's own
+// Trusted People entry, whose name/email track Account Information) onto a fresh secret.
+//
+// Safety property: totp_secret and totp_enabled are NOT touched. The old authenticator keeps
+// working for step-up until the user proves they scanned the new QR, so there is no window in
+// which the account has no working 2FA — and abandoning the flow changes nothing.
+async function beginRotationForAccountEmail(userId, oldEmail, newEmail) {
+  const person = await TrustedPerson.findOne({
+    user_id: userId,
+    $or: [{ is_bootstrap: true }, { email: String(oldEmail || '').toLowerCase() }]
+  });
+  if (!person) return null; // nothing enrolled against this address — nothing to rotate
+
+  person.email = String(newEmail).toLowerCase();
+  person.totp_pending_secret = authenticator.generateSecret();
+  person.totp_pending_since = new Date();
+  await person.save();
+
+  const otpauth_url = authenticator.keyuri(person.email, 'CylinderPro', person.totp_pending_secret);
+  const qr = await qrcode.toDataURL(otpauth_url);
+  return {
+    person_id: String(person._id),
+    name: person.name,
+    email: person.email,
+    otpauth_url,
+    qr,
+    secret: person.totp_pending_secret,
+    had_previous: !!(person.totp_secret && person.totp_enabled)
+  };
+}
+
+// Confirm a rotation: a valid code from the NEW QR promotes the pending secret. Only at this
+// point does the old secret stop working.
+async function confirmRotation(userId, personId, code) {
+  const person = await TrustedPerson.findOne({ _id: personId, user_id: userId });
+  if (!person) throw new HttpError(404, 'Trusted person not found');
+  if (!person.totp_pending_secret) throw new HttpError(400, 'No authenticator change is pending.');
+  if (!authenticator.verify({ token: String(code || '').trim(), secret: person.totp_pending_secret })) {
+    throw new HttpError(400, 'That code doesn\'t match the new QR — scan it again and retry.');
+  }
+  person.totp_secret = person.totp_pending_secret;
+  person.totp_enabled = true;
+  person.totp_pending_secret = '';
+  person.totp_pending_since = null;
+  await person.save();
+  return { message: `Authenticator updated for ${person.name}. The previous code no longer works.` };
+}
+
+// Abandon a pending rotation without touching the working secret.
+async function cancelRotation(userId, personId) {
+  const person = await TrustedPerson.findOne({ _id: personId, user_id: userId });
+  if (!person) throw new HttpError(404, 'Trusted person not found');
+  person.totp_pending_secret = '';
+  person.totp_pending_since = null;
+  await person.save();
+  return { message: 'Authenticator change cancelled — your existing code still works.' };
+}
+
+module.exports = {
+  startEnrollment, confirmEnrollment, validateAny,
+  beginRotationForAccountEmail, confirmRotation, cancelRotation
+};

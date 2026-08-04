@@ -251,7 +251,7 @@ async function validateCylinder(uid, { cylinderNo, direction, transactionId, cus
   return { valid: true };
 }
 
-async function listBills(userId, { date, customer_id, page, limit }) {
+async function listBills(userId, { date, customer_id, page, limit, search }) {
   const query = { user_id: userId, is_draft: { $ne: true } };
 
   if (date) {
@@ -263,6 +263,24 @@ async function listBills(userId, { date, customer_id, page, limit }) {
 
   if (customer_id) {
     query.customer_id = customer_id;
+  }
+
+  // Phase 24: server-side search so Transaction History matches against every bill, not just
+  // the batch already on screen. Customer name lives on the Customer doc, so it is resolved to
+  // ids first — the alternative ($lookup) would mean rewriting this as an aggregation.
+  if (search) {
+    const safe = String(search).trim().slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(safe, 'i');
+    const Customer = require('../models/Customer');
+    const matchedCustomers = await Customer.find(
+      { user_id: userId, company_name: re }, { _id: 1 }
+    ).lean();
+    query.$or = [
+      { bill_number: re },
+      { challan_no: re },
+      { transaction_type: re },
+      { customer_id: { $in: matchedCustomers.map(c => c._id) } }
+    ];
   }
 
   const { parsePagination, paginatedResponse } = require('../utils/paginate');

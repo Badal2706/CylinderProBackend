@@ -57,6 +57,16 @@ const customerSchema = new mongoose.Schema({
   is_active: {
     type: Boolean,
     default: true
+  },
+  // Soft delete ("Hide Customer"), Phase 24. Deliberately NOT reusing is_active: that is a
+  // business status the user sets in the edit form, and it already drives the ACTIVE/INACTIVE
+  // badge, the dashboard's active-customer counts and report.service. Overloading it would mean
+  // hiding a customer silently changed those numbers, and marking one INACTIVE silently removed
+  // them from the pickers. Hidden customers stay out of active lists/pickers but resolve
+  // normally in historical bills, payments and reports.
+  is_hidden: {
+    type: Boolean,
+    default: false
   }
 }, {
   timestamps: true // Automatically adds createdAt and updatedAt
@@ -65,6 +75,7 @@ const customerSchema = new mongoose.Schema({
 // Indexes for common queries (per-tenant name search & active-status filtering).
 customerSchema.index({ user_id: 1, company_name: 1 });
 customerSchema.index({ user_id: 1, is_active: 1 });
+customerSchema.index({ user_id: 1, is_hidden: 1 });
 
 // Virtual for customer_id (for compatibility with existing frontend)
 customerSchema.virtual('customer_id').get(function() {

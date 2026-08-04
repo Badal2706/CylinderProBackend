@@ -54,7 +54,8 @@ async function getStats(uid) {
 }
 
 async function getCylinderStock(uid) {
-  const [totalCylinders, cylindersAtPlant, cylindersInRotation, maintenanceCount, perLocation] = await Promise.all([
+  const [totalCylinders, cylindersAtPlant, cylindersInRotation, maintenanceCount,
+         perLocation, perLocationState, perGasType] = await Promise.all([
     Cylinder.countDocuments({ user_id: uid }),
     Cylinder.countDocuments({ user_id: uid, stock_state: 'IN_STOCK', under_maintenance: { $ne: true } }),
     Cylinder.countDocuments({ user_id: uid, stock_state: 'AT_CUSTOMER' }),
@@ -62,13 +63,37 @@ async function getCylinderStock(uid) {
     Cylinder.aggregate([
       { $match: { user_id: toOid(uid), stock_state: 'IN_STOCK', under_maintenance: { $ne: true } } },
       { $group: { _id: '$location', count: { $sum: 1 } } }
+    ]),
+    // Phase 25 charts. Both are a single $group over the same user_id match the counts above
+    // already use, so they add no new access pattern and need no new index.
+    Cylinder.aggregate([
+      { $match: { user_id: toOid(uid) } },
+      { $group: { _id: { location: '$location', state: '$stock_state' }, count: { $sum: 1 } } }
+    ]),
+    Cylinder.aggregate([
+      { $match: { user_id: toOid(uid) } },
+      { $group: { _id: '$gas_type', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
     ])
   ]);
 
   const byLocation = {};
   perLocation.forEach(r => { byLocation[r._id] = r.count; });
 
-  return { totalCylinders, cylindersInRotation, cylindersAtPlant, maintenanceCount, byLocation };
+  // { location: { IN_STOCK: n, AT_CUSTOMER: n } } — drives the stacked bar.
+  const byLocationState = {};
+  perLocationState.forEach(r => {
+    const loc = r._id.location || 'UNKNOWN';
+    if (!byLocationState[loc]) byLocationState[loc] = { IN_STOCK: 0, AT_CUSTOMER: 0 };
+    byLocationState[loc][r._id.state] = (byLocationState[loc][r._id.state] || 0) + r.count;
+  });
+
+  const byGasType = perGasType.map(r => ({ gas_type: r._id || 'Unknown', count: r.count }));
+
+  return {
+    totalCylinders, cylindersInRotation, cylindersAtPlant, maintenanceCount,
+    byLocation, byLocationState, byGasType
+  };
 }
 
 async function getOverLimitCustomers(uid) {

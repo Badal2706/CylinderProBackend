@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Customer = require('../models/Customer');
 const Bill = require('../models/Bill');
 const Payment = require('../models/Payment');
+const RentalCharge = require('../models/RentalCharge');
 const HttpError = require('../utils/HttpError');
 const { computeHoldings } = require('./holdings.service');
 const { insertInBatches } = require('../utils/bulkInsert');
@@ -34,8 +35,21 @@ async function getCustomerStats(customerId) {
   };
 }
 
-async function listCustomers(userId, { search, status, page, limit }) {
+async function listCustomers(userId, { search, status, page, limit, include_hidden }) {
   const query = { customer_type: 'REGULAR', user_id: userId };
+
+  // Soft-deleted customers stay out of every active list and picker. Historical bills,
+  // payments and reports look customers up by id and are unaffected by this filter.
+  //
+  // status=HIDDEN (Phase 26) is the dedicated "show hidden customers" view that the Unhide
+  // action lives on. include_hidden is compared against strings because it arrives straight
+  // off req.query — a bare truthiness check would treat "false" as true.
+  const wantHidden = status === 'HIDDEN';
+  const includeHidden = wantHidden ||
+    ['1', 'true', 'yes'].includes(String(include_hidden || '').toLowerCase());
+
+  if (wantHidden) query.is_hidden = true;
+  else if (!includeHidden) query.is_hidden = { $ne: true };
 
   if (search) {
     const safe = String(search).trim().slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -306,6 +320,94 @@ async function updateCustomer(userId, customerId, body) {
   return { message: 'Customer updated successfully' };
 }
 
+// ─── Phase 24: delete a customer, two modes ───
+
+// Soft delete. The record and every bill/payment it owns stay exactly as they are; the customer
+// simply stops appearing in active lists and pickers. Reversible by passing hidden: false.
+async function setCustomerHidden(userId, customerId, hidden) {
+  const customer = await Customer.findOneAndUpdate(
+    { _id: customerId, user_id: userId },
+    { is_hidden: !!hidden },
+    { returnDocument: 'after', runValidators: true }
+  );
+  if (!customer) throw new HttpError(404, 'Customer not found');
+  return {
+    message: hidden
+      ? `${customer.company_name} is now hidden. Their history and bills are untouched.`
+      : `${customer.company_name} is visible again.`,
+    is_hidden: customer.is_hidden
+  };
+}
+
+// Hard delete. Irreversible, and cascades so nothing is left pointing at a customer id that no
+// longer exists. Payments are removed by customer_id AND by the bills being deleted, because a
+// payment may reference either. Runs in a transaction when the deployment supports one (Atlas
+// replica set); standalone Mongo has no transactions, so it falls back to a sequenced delete.
+async function deleteCustomerCascade(userId, customerId) {
+  const customer = await Customer.findOne({ _id: customerId, user_id: userId });
+  if (!customer) throw new HttpError(404, 'Customer not found');
+
+  const bills = await Bill.find({ customer_id: customer._id }, { _id: 1 }).lean();
+  const billIds = bills.map(b => b._id);
+
+  const run = async (session) => {
+    const opts = session ? { session } : {};
+    const payRes = await Payment.deleteMany({
+      $or: [{ customer_id: customer._id }, { bill_id: { $in: billIds } }]
+    }, opts);
+    // RentalCharge also carries customer_id — leaving these behind would orphan them.
+    const rentRes = await RentalCharge.deleteMany({ customer_id: customer._id }, opts);
+    const billRes = await Bill.deleteMany({ customer_id: customer._id }, opts);
+    await Customer.deleteOne({ _id: customer._id, user_id: userId }, opts);
+    return {
+      payments: payRes.deletedCount || 0,
+      bills: billRes.deletedCount || 0,
+      rental_charges: rentRes.deletedCount || 0
+    };
+  };
+
+  // Production (Atlas) is a replica set, so this runs as a real transaction and the four
+  // deletes commit or roll back together. A standalone mongod — which is what local Docker
+  // dev uses — cannot do transactions at all, so we fall back to a sequenced delete there.
+  //
+  // The fallback is matched to that ONE condition on purpose. Catching every error and
+  // retrying without a session would mean a genuine mid-transaction abort on Atlas (write
+  // conflict, timeout, stepdown) silently re-ran the deletes non-atomically — losing the
+  // guarantee exactly when it was doing its job. Any other failure propagates.
+  // A standalone mongod reports this in more than one way depending on driver version: as
+  // IllegalOperation/code 20, or — the case actually seen on the local Docker image — as
+  // "does not support retryable writes". Both mean the same thing: no transactions here.
+  const unsupported = (err) => {
+    if (!err) return false;
+    if (err.code === 20 || err.codeName === 'IllegalOperation') return true;
+    return /Transaction numbers are only allowed|Transactions are not supported|replica set member or mongos|does not support retryable writes|does not support transactions/i
+      .test(err.message || '');
+  };
+
+  let counts;
+  let session = null;
+  try {
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => { counts = await run(session); });
+  } catch (err) {
+    if (!unsupported(err)) throw err;
+    console.warn('Cascade delete: transactions unavailable on this deployment — running sequentially.');
+    counts = await run(null);
+  } finally {
+    if (session) await session.endSession().catch(() => {});
+  }
+
+  return {
+    message: `${customer.company_name} and all their records were permanently deleted.`,
+    deleted: {
+      customer: 1,
+      bills: counts.bills,
+      payments: counts.payments,
+      rental_charges: counts.rental_charges
+    }
+  };
+}
+
 async function getGivenTransactions(userId, customerId, { page, limit } = {}) {
   const bills = await Bill.find(
     { customer_id: customerId, user_id: userId },
@@ -469,5 +571,7 @@ module.exports = {
   getGivenTransactions,
   getReceivedTransactions,
   getPersonalCylinderHistory,
-  getCustomerPayments
+  getCustomerPayments,
+  setCustomerHidden,
+  deleteCustomerCascade
 };

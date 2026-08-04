@@ -35,6 +35,16 @@ exports.totpEnroll = asyncHandler(async (req, res) => {
   res.json(await svc.totpEnroll(req.user.id, req.params.id));
 });
 
+exports.totpRotationConfirm = asyncHandler(async (req, res) => {
+  const totp = require('../services/totp.service');
+  res.json(await totp.confirmRotation(req.user.id, req.params.id, req.body.code));
+});
+
+exports.totpRotationCancel = asyncHandler(async (req, res) => {
+  const totp = require('../services/totp.service');
+  res.json(await totp.cancelRotation(req.user.id, req.params.id));
+});
+
 exports.totpConfirm = asyncHandler(async (req, res) => {
   res.json(await svc.totpConfirm(req.user.id, req.params.id, req.body.code));
 });

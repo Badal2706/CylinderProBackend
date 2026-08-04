@@ -11,6 +11,8 @@ router.get('/:id', ctrl.getCustomerDetail);
 router.post('/', ctrl.createCustomer);
 router.post('/import', ctrl.importCustomers);
 router.put('/:id', ctrl.updateCustomer);
+router.patch('/:id/hidden', ctrl.setCustomerHidden);   // soft delete / restore
+router.delete('/:id', ctrl.deleteCustomer);            // hard delete + cascade
 router.get('/:id/transactions/given', ctrl.getGivenTransactions);
 router.get('/:id/transactions/received', ctrl.getReceivedTransactions);
 router.get('/:id/personal-cylinder-history', ctrl.getPersonalCylinderHistory);

@@ -23,6 +23,16 @@ exports.updateLocationProfilesBatch = asyncHandler(async (req, res) => {
   res.json(result);
 });
 
+// Phase 26: step 1 — send a code to the new address. Persists nothing.
+exports.requestEmailChange = asyncHandler(async (req, res) => {
+  res.json(await profileService.requestEmailChange(req.user.id, req.body));
+});
+
+// Step 2 — correct code persists the new email and starts the authenticator rotation.
+exports.confirmEmailChange = asyncHandler(async (req, res) => {
+  res.json(await profileService.confirmEmailChange(req.user.id, req.body));
+});
+
 exports.changePassword = asyncHandler(async (req, res) => {
   const result = await profileService.changePassword(req.user.id, req.body);
   // Phase 19: route is step-up-gated; record who approved the password change.

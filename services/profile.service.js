@@ -1,3 +1,4 @@
+const jwt = require('jsonwebtoken');
 const archiverLib = require('archiver');
 // archiver v8 exports named members ({ Archiver, create, ... }); older versions export a
 // callable function. Support both so the ZIP export works regardless of installed version.
@@ -117,18 +118,14 @@ async function updateAccount(userId, { name, phone, email, current_password }) {
   if (typeof name === 'string' && name.trim()) user.name = name.trim();
   if (typeof phone === 'string') user.phone = phone.trim();
 
-  let emailChanged = false;
+  // Phase 26: this endpoint no longer changes the email. An address is only ever written to
+  // the account after a 6-digit code sent to THAT address has been entered correctly, which is
+  // what requestEmailChange/confirmEmailChange below implement. Guarding here rather than
+  // silently ignoring the field means a stale client can't quietly skip verification.
+  const emailChanged = false;
   if (email && email.toLowerCase() !== user.email) {
-    // 400 (not 401) — a missing/wrong password here must never trigger the client's
-    // expired-session auto-logout.
-    if (!current_password || !(await user.comparePassword(current_password))) {
-      throw new HttpError(400, 'Current password is required to change email');
-    }
-    const exists = await User.findOne({ email: email.toLowerCase(), _id: { $ne: user._id } });
-    if (exists) throw new HttpError(400, 'That email is already in use');
-    user.email = email.toLowerCase();
-    user.email_verified = false; // a new address must be verified again
-    emailChanged = true;
+    throw new HttpError(400,
+      'Changing your email needs verification — use the "Verify new email" step so we can send a code to the new address.');
   }
 
   // Phase 20: the bootstrap Trusted Person mirrors Account Information — sync BEFORE saving
@@ -140,6 +137,100 @@ async function updateAccount(userId, { name, phone, email, current_password }) {
 
   await user.save();
   return { message: 'Profile updated', name: user.name, email: user.email, phone: user.phone || '' };
+}
+
+// ─── Phase 26: email change, gated on proving control of the NEW inbox ───
+//
+// Step 1. Validate the change and send a code TO THE NEW ADDRESS. Nothing is written to the
+// user document here — not the email, not email_verified, and no authenticator rotation is
+// started. Abandoning at this point therefore leaves the account exactly as it was.
+// The returned token carries the pending address so the client can't substitute a different
+// one between the two calls.
+async function requestEmailChange(userId, { email, current_password }) {
+  const user = await User.findById(userId);
+  if (!user) throw new HttpError(404, 'User not found');
+
+  const next = String(email || '').toLowerCase().trim();
+  if (!next) throw new HttpError(400, 'A new email address is required');
+  if (next === user.email) throw new HttpError(400, 'That is already your account email');
+
+  // 400 (not 401) — a wrong password must never trip the client's expired-session auto-logout.
+  if (!current_password || !(await user.comparePassword(current_password))) {
+    throw new HttpError(400, 'Current password is required to change email');
+  }
+  const exists = await User.findOne({ email: next, _id: { $ne: user._id } });
+  if (exists) throw new HttpError(400, 'That email is already in use');
+
+  const otp = require('./otp.service');
+  await otp.sendOtp({
+    userId, purpose: 'USER_EMAIL_VERIFY', email: next,
+    context: `change your CylinderPro account email to ${next}`
+  });
+
+  const pending_token = jwt.sign(
+    { id: String(userId), purpose: 'email_change', email: next },
+    process.env.JWT_SECRET,
+    { expiresIn: 900 }
+  );
+  return {
+    message: `We sent a 6-digit code to ${next}. Enter it to confirm the change.`,
+    pending_email: next,
+    pending_token
+  };
+}
+
+// Step 2. Correct code → the email is persisted, and only then does the authenticator rotation
+// begin (Phase 25 behaviour from here on: the OLD TOTP secret stays valid until the user
+// confirms the new QR, so 2FA is never disabled).
+async function confirmEmailChange(userId, { pending_token, code }) {
+  let payload;
+  try {
+    payload = jwt.verify(pending_token, process.env.JWT_SECRET);
+  } catch {
+    throw new HttpError(400, 'This email change expired — start again.');
+  }
+  if (payload.purpose !== 'email_change' || String(payload.id) !== String(userId)) {
+    throw new HttpError(400, 'Invalid email-change token');
+  }
+
+  const user = await User.findById(userId);
+  if (!user) throw new HttpError(404, 'User not found');
+  const previousEmail = user.email;
+
+  // Throws on a wrong/expired/exhausted code — the email stays unwritten.
+  const otp = require('./otp.service');
+  await otp.verifyOtp({ userId, purpose: 'USER_EMAIL_VERIFY', email: payload.email, code });
+
+  // Re-check uniqueness: the address could have been claimed while the code was in flight.
+  const exists = await User.findOne({ email: payload.email, _id: { $ne: user._id } });
+  if (exists) throw new HttpError(400, 'That email is already in use');
+
+  user.email = payload.email;
+  user.email_verified = true; // proven by the code we just checked
+
+  // The bootstrap Trusted Person mirrors Account Information — sync before saving so a
+  // conflict aborts the whole change rather than half-applying it.
+  // verified:true — the code we just checked was sent to THIS address, so the bootstrap entry
+  // must not have its authenticator wiped; the rotation below stages the replacement instead.
+  await require('./trustedPeople.service')
+    .syncBootstrap(userId, { name: user.name, email: user.email, verified: true });
+  await user.save();
+
+  let totp_rotation = null;
+  try {
+    totp_rotation = await require('./totp.service')
+      .beginRotationForAccountEmail(userId, previousEmail, user.email);
+  } catch (e) {
+    // A rotation failure must not undo a verified email change; surface it in the log so the
+    // user can rotate manually from Trusted People instead.
+    console.error('TOTP rotation after email change failed:', e.message);
+  }
+
+  return {
+    message: 'Email verified and updated.',
+    name: user.name, email: user.email, phone: user.phone || '',
+    totp_rotation
+  };
 }
 
 async function changePassword(userId, { current_password, new_password, confirm_password }) {
@@ -365,5 +456,7 @@ module.exports = {
   setActiveLocation,
   logoutAll,
   deleteAccount,
-  exportData
+  exportData,
+  requestEmailChange,
+  confirmEmailChange
 };

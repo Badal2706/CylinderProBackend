@@ -14,6 +14,12 @@ const trustedPersonSchema = new mongoose.Schema({
   // totp_enabled flips true only after the person confirms with a valid first code.
   totp_secret:  { type: String, default: '' },
   totp_enabled: { type: Boolean, default: false },
+  // Phase 25: a rotation in progress. When the account email changes we generate the new secret
+  // HERE and leave totp_secret/totp_enabled untouched, so the existing authenticator keeps
+  // working the whole time. Only a valid code from the new QR promotes pending → totp_secret.
+  // That means 2FA is never off, and an abandoned rotation simply expires with no effect.
+  totp_pending_secret: { type: String, default: '' },
+  totp_pending_since:  { type: Date, default: null },
   added_at:  { type: Date, default: Date.now },
   // Active = usable for step-up verification. New people activate on email verification;
   // the bootstrap owner record is created active.

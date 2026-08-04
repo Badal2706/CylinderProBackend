@@ -255,14 +255,27 @@ async function getDSR(uid, { date, location }) {
   const start = new Date(day); start.setHours(0, 0, 0, 0);
   const end = new Date(day); end.setHours(23, 59, 59, 999);
 
+  const loc = LOCATIONS.includes(location) ? location : null;
+
+  // Phase 24: a site's DSR must also show stock it sent out to the other sites that day.
+  // Internal transfers carry from_location/to_location instead of location, so a plain
+  // { location: loc } match never saw them and the blanket $ne excluded them everywhere.
+  // With a site selected: that site's customer bills PLUS transfers originating there.
+  // With ALL selected: customer bills only, unchanged — a transfer is an internal move, and
+  // counting it alongside every site's sales would inflate the combined day's figures.
   const query = {
     user_id: uid,
     is_draft: { $ne: true },
-    transaction_category: { $ne: 'INTERNAL_TRANSFER' },
     bill_date: { $gte: start, $lte: end }
   };
-  const loc = LOCATIONS.includes(location) ? location : null;
-  if (loc) query.location = loc;
+  if (loc) {
+    query.$or = [
+      { transaction_category: { $ne: 'INTERNAL_TRANSFER' }, location: loc },
+      { transaction_category: 'INTERNAL_TRANSFER', from_location: loc }
+    ];
+  } else {
+    query.transaction_category = { $ne: 'INTERNAL_TRANSFER' };
+  }
 
   const bills = await Bill.find(query)
     .populate('customer_id', 'company_name')
@@ -272,7 +285,9 @@ async function getDSR(uid, { date, location }) {
   // One row per bill per gas×size, with PC (personal cylinders) as their own columns.
   const rows = [];
   const totals = { filled_qty: 0, empty_qty: 0, pc_in: 0, pc_out: 0, amount: 0 };
+  const transferTotals = { filled_qty: 0, empty_qty: 0, pc_in: 0, pc_out: 0, amount: 0 };
   for (const b of bills) {
+    const isTransfer = b.transaction_category === 'INTERNAL_TRANSFER';
     const byCombo = {};
     for (const li of b.line_items) {
       const gas = li.gas_type_name || '';
@@ -282,7 +297,14 @@ async function getDSR(uid, { date, location }) {
         byCombo[key] = {
           bill_id: String(b._id),
           bill_number: b.bill_number, challan_no: b.challan_no || '',
-          location: b.location, customer_name: b.customer_id ? b.customer_id.company_name : '',
+          // A transfer has no `location` and no customer — show where it went instead, so the
+          // row reads as "stock sent to Palanpur Office" rather than a blank customer line.
+          location: isTransfer ? b.from_location : b.location,
+          customer_name: isTransfer
+            ? `→ ${LOCATION_LABELS[b.to_location] || b.to_location} (Internal Transfer)`
+            : (b.customer_id ? b.customer_id.company_name : ''),
+          is_transfer: isTransfer,
+          to_location: isTransfer ? b.to_location : undefined,
           gas_type: gas, size,
           filled_qty: 0, empty_qty: 0, pc_in: 0, pc_out: 0, amount: 0,
           remarks: ''
@@ -292,13 +314,25 @@ async function getDSR(uid, { date, location }) {
       if (!r.remarks && li.remarks) r.remarks = li.remarks; // per-row DSR note (Phase 10)
       if (li.direction === 'GIVEN') { r.filled_qty += li.quantity || 0; r.amount += li.amount || 0; }
       if (li.direction === 'RECEIVED') r.empty_qty += li.quantity || 0;
+      // Internal-transfer items carry direction 'TRANSFER' — neither given nor received. Count
+      // them as the quantity moved out so the row shows a number instead of a blank 0, and note
+      // that this only ever lands in transfer_totals, never in the sales totals.
+      if (li.direction === 'TRANSFER') r.filled_qty += li.quantity || 0;
       r.pc_in += li.personalCylindersIn || 0;   // PC taken from customer
       r.pc_out += li.personalCylindersOut || 0; // PC returned (refilled) to customer
     }
     Object.values(byCombo).forEach(r => {
       rows.push(r);
+      // Phase 25: the total row must account for every row shown, transfers included — a total
+      // that silently omitted visible rows was the reported bug. transfer_totals is kept as an
+      // additional breakdown so the transfer share of the total stays inspectable.
       totals.filled_qty += r.filled_qty; totals.empty_qty += r.empty_qty;
       totals.pc_in += r.pc_in; totals.pc_out += r.pc_out; totals.amount += r.amount;
+      if (r.is_transfer) {
+        transferTotals.filled_qty += r.filled_qty; transferTotals.empty_qty += r.empty_qty;
+        transferTotals.pc_in += r.pc_in; transferTotals.pc_out += r.pc_out;
+        transferTotals.amount += r.amount;
+      }
     });
   }
 
@@ -314,7 +348,8 @@ async function getDSR(uid, { date, location }) {
     location_label: loc ? LOCATION_LABELS[loc] : 'All Locations',
     reporting_person,
     rows,
-    totals
+    totals,
+    transfer_totals: transferTotals
   };
 }
 

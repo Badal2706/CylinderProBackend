@@ -132,7 +132,13 @@ async function createBootstrap(userId, { name, email }) {
 
 // Account Information saves propagate here. An email CHANGE resets the entry's verification
 // (it's a new address) — approvals from it are blocked until the new address verifies.
-async function syncBootstrap(userId, { name, email }) {
+// `verified` (Phase 26): the caller has already proved control of the new address with a
+// 6-digit code sent to it. Historically this function wiped the authenticator on any email
+// change because the new address was unproven — but doing that during a verified change left
+// the account with NO working 2FA (totp_secret cleared, is_active false) before the rotation in
+// totp.service could preserve it. On a verified change we keep the working secret and let
+// beginRotationForAccountEmail stage the replacement, so 2FA is continuous.
+async function syncBootstrap(userId, { name, email, verified = false }) {
   const boot = await TrustedPerson.findOne({ user_id: userId, is_bootstrap: true });
   if (!boot) return null;
   if (name && String(name).trim() && boot.name !== String(name).trim()) boot.name = String(name).trim();
@@ -141,10 +147,15 @@ async function syncBootstrap(userId, { name, email }) {
     const dup = await TrustedPerson.findOne({ user_id: userId, email: clean, _id: { $ne: boot._id } });
     if (dup) throw new HttpError(400, `${clean} already belongs to another trusted person — remove them first or use a different email.`);
     boot.email = clean;
-    boot.email_verified = false;
-    boot.totp_secret = '';
-    boot.totp_enabled = false;
-    boot.is_active = false;
+    if (verified) {
+      boot.email_verified = true;   // just proved by the OTP sent to this address
+      // totp_secret / totp_enabled / is_active deliberately left alone.
+    } else {
+      boot.email_verified = false;
+      boot.totp_secret = '';
+      boot.totp_enabled = false;
+      boot.is_active = false;
+    }
   }
   await boot.save();
   return boot;
