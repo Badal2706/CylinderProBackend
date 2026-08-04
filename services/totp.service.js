@@ -90,6 +90,33 @@ async function beginRotationForAccountEmail(userId, oldEmail, newEmail) {
   };
 }
 
+// On-demand rotation (Phase 27): re-issue a fresh QR for an already-enrolled person at any time
+// — e.g. the owner chose "Not now" during an email-change rotation and later wants to redo it,
+// or someone re-installs their authenticator app. Same safety property as above: the existing
+// secret keeps working until the new QR is confirmed, so 2FA is never disabled. If the person
+// has no secret yet, this behaves like a normal fresh enrollment via the pending slot.
+async function beginRotation(userId, personId) {
+  const person = await TrustedPerson.findOne({ _id: personId, user_id: userId });
+  if (!person) throw new HttpError(404, 'Trusted person not found');
+  if (!person.is_active) throw new HttpError(400, 'Verify this person\'s email first.');
+
+  person.totp_pending_secret = authenticator.generateSecret();
+  person.totp_pending_since = new Date();
+  await person.save();
+
+  const otpauth_url = authenticator.keyuri(person.email, 'CylinderPro', person.totp_pending_secret);
+  const qr = await qrcode.toDataURL(otpauth_url);
+  return {
+    person_id: String(person._id),
+    name: person.name,
+    email: person.email,
+    otpauth_url,
+    qr,
+    secret: person.totp_pending_secret,
+    had_previous: !!(person.totp_secret && person.totp_enabled)
+  };
+}
+
 // Confirm a rotation: a valid code from the NEW QR promotes the pending secret. Only at this
 // point does the old secret stop working.
 async function confirmRotation(userId, personId, code) {
@@ -119,5 +146,5 @@ async function cancelRotation(userId, personId) {
 
 module.exports = {
   startEnrollment, confirmEnrollment, validateAny,
-  beginRotationForAccountEmail, confirmRotation, cancelRotation
+  beginRotationForAccountEmail, beginRotation, confirmRotation, cancelRotation
 };

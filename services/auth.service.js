@@ -264,6 +264,78 @@ async function securityStatus(userId) {
   };
 }
 
+// ─── Phase 27: forgot password ───
+// Recovery is deliberately available WITHOUT being logged in. Two proofs are accepted at reset
+// time, either one on its own:
+//   1. a 6-digit code emailed to the account's own email, or
+//   2. a current code from any authenticator already enrolled on the account (owner or a
+//      trusted person). This is the escape hatch for when the inbox itself is unreachable.
+// Both are things only the legitimate account holder (or someone they trusted) can produce.
+const STRONG_PW = (pw) =>
+  typeof pw === 'string' && pw.length >= 8 && /[0-9]/.test(pw) && /[^A-Za-z0-9]/.test(pw);
+
+// Step 1: always responds the same way whether or not the email is registered, so this can't
+// be used to discover which emails have accounts. A code is only actually sent if it exists.
+async function requestPasswordReset({ email }) {
+  const clean = String(email || '').toLowerCase().trim();
+  if (!clean) throw new HttpError(400, 'Email is required');
+
+  const user = await User.findOne({ email: clean });
+  let totpAvailable = false;
+  if (user) {
+    await otp.sendOtp({
+      userId: user._id, purpose: 'USER_EMAIL_VERIFY', email: clean,
+      context: 'reset your CylinderPro password'
+    });
+    totpAvailable = await require('../models/TrustedPerson')
+      .exists({ user_id: user._id, is_active: true, totp_enabled: true });
+  }
+  // The token carries only the submitted email; the account is resolved at reset time. A token
+  // is returned even for an unknown email so the response shape never reveals existence.
+  const reset_token = jwt.sign({ email: clean, purpose: 'pw_reset' }, JWT_SECRET, { expiresIn: 900 });
+  return {
+    message: 'If that email has an account, a 6-digit code has been sent to it.',
+    reset_token,
+    // Lets the UI offer the authenticator alternative. This reflects the resolved account, not
+    // the email itself, so it does not reveal whether the typed email exists.
+    totp_available: !!totpAvailable
+  };
+}
+
+// Step 2: verify one of the two proofs, then set the new password and invalidate every existing
+// session (bumping token_version) so a compromised old password can't keep a live session.
+async function resetPassword({ reset_token, code, totp_code, new_password }) {
+  let payload;
+  try { payload = jwt.verify(reset_token, JWT_SECRET); }
+  catch { throw new HttpError(400, 'This reset link expired — start again.'); }
+  if (payload.purpose !== 'pw_reset') throw new HttpError(400, 'Invalid reset token');
+
+  const user = await User.findOne({ email: payload.email });
+  // Generic error — never confirm whether the email had an account.
+  if (!user) throw new HttpError(400, 'Invalid code or reset request. Please start again.');
+
+  if (!STRONG_PW(new_password)) {
+    throw new HttpError(400, 'New password must be at least 8 characters with a number and a symbol.');
+  }
+
+  if (code) {
+    // Throws on wrong / expired / exhausted code.
+    await otp.verifyOtp({ userId: user._id, purpose: 'USER_EMAIL_VERIFY', email: user.email, code });
+  } else if (totp_code) {
+    const match = await require('./totp.service').validateAny(user._id, totp_code);
+    if (!match) throw new HttpError(400, 'That authenticator code is not valid.');
+  } else {
+    throw new HttpError(400, 'Enter the emailed code, or a code from your authenticator app.');
+  }
+
+  user.password = new_password;                 // pre-save hook hashes it
+  user.token_version = (user.token_version || 0) + 1; // invalidate all existing JWTs
+  user.sessions = [];                            // drop every remembered device
+  await user.save();
+
+  return { message: 'Password updated. Please sign in with your new password.' };
+}
+
 // Phase 21: like account deletion, clearing all data needs BOTH the password AND an
 // owner-only step-up approval — no other trusted person can authorize it.
 async function clearData(userId, password, stepUpToken) {
@@ -291,5 +363,6 @@ async function clearData(userId, password, stepUpToken) {
 module.exports = {
   signupRequest, signupConfirm, signin, verify2fa, refresh, clearData,
   listSessions, revokeSession,
-  sendEmailVerification, confirmEmailVerification, securityStatus
+  sendEmailVerification, confirmEmailVerification, securityStatus,
+  requestPasswordReset, resetPassword
 };

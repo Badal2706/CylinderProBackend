@@ -19,6 +19,15 @@ exports.signin = asyncHandler(async (req, res) => {
   res.json(await authService.signin({ ...req.body, ...deviceMeta(req) }));
 });
 
+// Phase 27: forgot password — request a code, then reset with it or an authenticator code.
+exports.forgotPasswordRequest = asyncHandler(async (req, res) => {
+  res.json(await authService.requestPasswordReset(req.body));
+});
+
+exports.forgotPasswordReset = asyncHandler(async (req, res) => {
+  res.json(await authService.resetPassword(req.body));
+});
+
 exports.verify2fa = asyncHandler(async (req, res) => {
   res.json(await authService.verify2fa({ ...req.body, ...deviceMeta(req) }));
 });

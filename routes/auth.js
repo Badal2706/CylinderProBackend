@@ -7,6 +7,9 @@ router.post('/signup', ctrl.signup);
 router.post('/signup/confirm', ctrl.signupConfirm);
 router.post('/signin', ctrl.signin);
 router.post('/signin/verify-2fa', ctrl.verify2fa);
+// Phase 27: forgot password. Rate-limited alongside signin (see server.js) to bound brute force.
+router.post('/forgot-password', ctrl.forgotPasswordRequest);
+router.post('/forgot-password/reset', ctrl.forgotPasswordReset);
 router.post('/refresh', authMiddleware, ctrl.refresh);
 router.post('/clear-data', authMiddleware, ctrl.clearData);
 

@@ -88,6 +88,7 @@ app.get('/api/health', (req, res) => {
 const authRoutes = require('./routes/auth');
 app.use('/api/auth/signin', authLimiter);
 app.use('/api/auth/signup', authLimiter);
+app.use('/api/auth/forgot-password', authLimiter); // Phase 27: bound reset brute force
 app.use('/api/auth', authRoutes);
 
 // General API rate limit for everything else.

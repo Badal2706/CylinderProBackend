@@ -19,6 +19,7 @@ router.post('/:id/totp/confirm', ctrl.totpConfirm);
 // Deliberately NOT step-up gated — the user has just changed their email and may not have a
 // working second approver; requiring step-up here could strand them mid-rotation. Safe because
 // confirming needs a valid code from the new QR, and cancelling only discards the pending secret.
+router.post('/:id/totp/rotation/begin', ctrl.totpRotationBegin);   // re-scan on demand
 router.post('/:id/totp/rotation/confirm', ctrl.totpRotationConfirm);
 router.post('/:id/totp/rotation/cancel', ctrl.totpRotationCancel);
 
