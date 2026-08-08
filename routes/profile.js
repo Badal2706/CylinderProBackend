@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
 const { requireStepUpAuth } = require('../middleware/stepUp');
+const validate = require('../middleware/validate');
+const V = require('../validators/schemas');
 const ctrl = require('../controllers/profile.controller');
 
 router.use(authMiddleware);
@@ -19,7 +21,7 @@ router.post('/email-change/request', requireStepUpAuth, ctrl.requestEmailChange)
 router.post('/email-change/verify', ctrl.confirmEmailChange);
 // Viewing stays open to any logged-in session; SAVING requires step-up approval (Phase 18).
 router.get('/business', ctrl.getBusinessProfile);
-router.put('/business', requireStepUpAuth, ctrl.updateBusinessProfile);
+router.put('/business', requireStepUpAuth, validate(V.businessProfile), ctrl.updateBusinessProfile);
 router.get('/locations', ctrl.getLocationProfiles);
 // Phase 20: single shared save for all three location profiles.
 router.put('/locations', requireStepUpAuth, ctrl.updateLocationProfilesBatch);

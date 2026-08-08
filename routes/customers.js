@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
+const validate = require('../middleware/validate');
+const V = require('../validators/schemas');
 const ctrl = require('../controllers/customers.controller');
 const rentalCtrl = require('../controllers/rental.controller');
 
@@ -8,9 +10,9 @@ router.use(authMiddleware);
 
 router.get('/', ctrl.listCustomers);
 router.get('/:id', ctrl.getCustomerDetail);
-router.post('/', ctrl.createCustomer);
-router.post('/import', ctrl.importCustomers);
-router.put('/:id', ctrl.updateCustomer);
+router.post('/', validate(V.customerCreate), ctrl.createCustomer);
+router.post('/import', validate(V.importRows), ctrl.importCustomers);
+router.put('/:id', validate(V.customerUpdate), ctrl.updateCustomer);
 router.patch('/:id/hidden', ctrl.setCustomerHidden);   // soft delete / restore
 router.delete('/:id', ctrl.deleteCustomer);            // hard delete + cascade
 router.get('/:id/transactions/given', ctrl.getGivenTransactions);

@@ -6,7 +6,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
-const rateLimit = require('express-rate-limit');
+const { authLimiter, authSlowDown, apiLimiter } = require('./config/rateLimits');
 const bodyParser = require('body-parser');
 const mongoose = require('mongoose');
 const connectDB = require('./config/mongodb');
@@ -53,22 +53,11 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // --- NoSQL injection sanitization (Express 5 safe) ---
 app.use(mongoSanitize);
 
-// --- Rate limiting ---
-// Login: 10 attempts / 15 min / IP. General API: 100 req / min / IP.
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many login attempts. Please try again in 15 minutes.' }
-});
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests. Please slow down and try again shortly.' }
-});
+// --- Rate limiting (Phase 30) ---
+// Limiters are defined in config/rateLimits.js and are fully env-configurable. They run on an
+// in-memory store, correct for the current SINGLE PM2 process. PHASE-30 NOTE: if PM2 is ever moved
+// to cluster mode / multiple instances, the in-memory counters become per-process and must be
+// backed by a shared store (Redis) — flag before switching.
 
 // Connect to MongoDB
 connectDB();
@@ -84,11 +73,18 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Auth routes (unprotected) — tighter limit on the credential endpoints.
+// Auth routes (unprotected) — strict backoff + failure-cap on EVERY credential/OTP/2FA endpoint.
+// Phase 30: cover the previously-unlimited OTP-confirm, 2FA, reset, and email-verify steps too.
+// Order matters: slow-down first (adds delay), then the hard failure cap, then the router.
 const authRoutes = require('./routes/auth');
-app.use('/api/auth/signin', authLimiter);
-app.use('/api/auth/signup', authLimiter);
-app.use('/api/auth/forgot-password', authLimiter); // Phase 27: bound reset brute force
+const authGuard = [authSlowDown, authLimiter];
+app.use('/api/auth/signin', authGuard);            // password login
+app.use('/api/auth/signup', authGuard);            // signup OTP gatekeeper
+app.use('/api/auth/signup/confirm', authGuard);    // signup OTP verification
+app.use('/api/auth/signin/verify-2fa', authGuard); // TOTP / 2FA verification
+app.use('/api/auth/forgot-password', authGuard);   // reset request (OTP send)
+app.use('/api/auth/forgot-password/reset', authGuard); // reset confirmation
+app.use('/api/auth/verify-email', authGuard);      // email-change OTP send + confirm
 app.use('/api/auth', authRoutes);
 
 // General API rate limit for everything else.

@@ -1,5 +1,6 @@
 const asyncHandler = require('../middleware/asyncHandler');
 const profileService = require('../services/profile.service');
+const logger = require('../logger');
 
 exports.getAccount = asyncHandler(async (req, res) => {
   res.json(await profileService.getAccount(req.user.id));
@@ -92,6 +93,8 @@ exports.exportData = async (req, res) => {
   try {
     await profileService.exportData(req.user.id, res);
   } catch (err) {
-    if (!res.headersSent) res.status(500).json({ error: err.message });
+    // Phase 30: log the real error server-side; return a generic message (no raw error text).
+    logger.error(`exportData failed: ${err.stack || err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: 'Could not generate the data export. Please try again.' });
   }
 };

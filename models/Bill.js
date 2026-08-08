@@ -123,6 +123,12 @@ const billSchema = new mongoose.Schema({
     trim: true,
     default: ''
   },
+  // Phase 27: delivery vehicle number. Strictly optional — never blocks a save, blank if unused.
+  vehicle_number: {
+    type: String,
+    trim: true,
+    default: ''
+  },
   total_given_qty: {
     type: Number,
     default: 0

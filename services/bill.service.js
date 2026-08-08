@@ -468,7 +468,9 @@ async function createBill(userId, body, stepUp = null) {
     location,
     remarks,
     given_items,
-    received_items
+    received_items,
+    bill_number: clientBillNumber, // Phase 27: user-editable, prefilled from the sequence
+    vehicle_number                 // Phase 27: optional delivery vehicle
   } = body;
 
   if (!customer_id && customer_type !== 'ONE_TIME') {
@@ -529,7 +531,7 @@ async function createBill(userId, body, stepUp = null) {
     }
   }
 
-  // Look up the stock state of every referenced cylinder (unmapped numbers are allowed as a fallback)
+  // Look up the stock state of every referenced cylinder (existence is enforced just below)
   const allSerials = [...new Set([...givenSerials, ...receivedSerials])];
   const inventory = await Cylinder.find({ user_id: userId, rotational_number: { $in: allSerials } });
   const stockByRot = {};
@@ -537,10 +539,21 @@ async function createBill(userId, body, stepUp = null) {
   inventory.forEach(c => { stockByRot[c.rotational_number] = c.stock_state; cylByRot[c.rotational_number] = c; });
   const receivedSet = new Set(receivedSerials);
 
+  // ─── Phase 28: existence enforcement ───
+  // Every referenced cylinder number must be a REAL cylinder in inventory. Previously unmapped
+  // numbers were silently allowed as a "manual-entry fallback", which — once the UI's existence
+  // gate was lost in the Phase 24 picker rebuild — let fabricated numbers (e.g. "123456") save.
+  // Reject them here so the server never depends on client-only validation for this.
+  for (const s of allSerials) {
+    if (!cylByRot[s]) {
+      throw new HttpError(400, `Cylinder "${s}" was not found in inventory. Only registered cylinders can be added.`);
+    }
+  }
+
   // ─── Per-line gas-type + size consistency re-validation ───
   // Every serial within a single line item must match that line's gas type and size
   // (the frontend locks this per line, but the backend must enforce it independently).
-  // Unmapped serials (not in inventory) are skipped — they're a manual-entry fallback.
+  // Existence is already enforced above, so every serial maps to a real cylinder here.
   const gasIds = [...new Set(allItems.map(i => String(i.gas_type_id)).filter(Boolean))];
   const sizeIds = [...new Set(allItems.map(i => String(i.cylinder_size_id)).filter(Boolean))];
   const [gasDocs, sizeDocs] = await Promise.all([
@@ -559,7 +572,7 @@ async function createBill(userId, body, stepUp = null) {
     for (const raw of item.serial_numbers || []) {
       const s = String(raw).trim();
       const cyl = cylByRot[s];
-      if (!cyl) continue; // unmapped — allow
+      if (!cyl) continue; // existence enforced above — defensive
       if (cyl.gas_type !== lineGas || cyl.capacity !== lineSize) {
         throw new HttpError(400, `Cylinder "${s}" is ${cyl.gas_type} / ${cyl.capacity} — it doesn't match this line (${lineGas} / ${lineSize}). Put it in its own cylinder line.`);
       }
@@ -568,7 +581,7 @@ async function createBill(userId, body, stepUp = null) {
 
   for (const s of givenSerials) {
     const stock = stockByRot[s];
-    if (stock === undefined) continue; // unmapped — allow with frontend warning
+    if (stock === undefined) continue; // existence enforced above — defensive
     const isSwapRoundTrip = transaction_type === 'SWAP' && receivedSet.has(s);
     if (stock !== 'IN_STOCK' && !isSwapRoundTrip) {
       throw new HttpError(400, `Cylinder "${s}" is not available to give out (it is with a customer). Only in-stock cylinders can be given.`);
@@ -585,7 +598,7 @@ async function createBill(userId, body, stepUp = null) {
   const givenSet = new Set(givenSerials);
   for (const s of receivedSerials) {
     const stock = stockByRot[s];
-    if (stock === undefined) continue; // unmapped — allow with frontend warning
+    if (stock === undefined) continue; // existence enforced above — defensive
     // SWAP round-trip the outbound way (Phase 14, filling-vendor flow): a cylinder GIVEN on
     // this same bill (sent for filling) may be RECEIVED back on the same bill too.
     const isOutboundRoundTrip = transaction_type === 'SWAP' && givenSet.has(s);
@@ -608,7 +621,20 @@ async function createBill(userId, body, stepUp = null) {
 
   // Finalizing a draft reuses the draft document (and its bill_number from the real sequence).
   const draftDoc = await resolveDraft(userId, body.draft_id);
-  const billNumber = draftDoc ? draftDoc.bill_number : await generateBillNumber();
+  // Phase 27: the form prefills bill_number from the sequence but lets the user edit it freely.
+  // Use whatever the user submits (validating uniqueness); fall back to the generated next value.
+  // A finalized draft keeps its own reserved number unless the user explicitly changed it.
+  let billNumber;
+  const trimmedClient = String(clientBillNumber || '').trim();
+  if (trimmedClient) {
+    const clash = await Bill.findOne({ bill_number: trimmedClient, is_draft: { $ne: true } });
+    if (clash && (!draftDoc || String(clash._id) !== String(draftDoc._id))) {
+      throw new HttpError(400, `Bill number "${trimmedClient}" is already used — choose a different one.`);
+    }
+    billNumber = trimmedClient;
+  } else {
+    billNumber = draftDoc ? draftDoc.bill_number : await generateBillNumber();
+  }
 
   // Recompute totals server-side — never trust client `amount`. Personal cylinders RETURNED
   // (personalCylindersOut) are refilled service items charged at the same line rate:
@@ -749,6 +775,7 @@ async function createBill(userId, body, stepUp = null) {
     bill_date,
     transaction_type,
     challan_no: String(challan_no).trim(),
+    vehicle_number: String(vehicle_number || '').trim().toUpperCase(), // Phase 27: optional
     total_given_qty,
     total_received_qty,
     total_bill_amount,
@@ -988,6 +1015,7 @@ async function updateBill(user, billId, body, stepUp = null) {
   // line_items === undefined → keep the existing lines untouched (bill-number-only edits,
   // which stay allowed even after the 3-day lock).
   const { bill_date, bill_number, challan_no, transaction_type, line_items, logEdit } = body;
+  const vehicle_number = body.vehicle_number; // Phase 27: optional, editable
   const keepLines = line_items === undefined;
   if (!keepLines && (!Array.isArray(line_items) || line_items.length === 0)) {
     throw new HttpError(400, 'At least one cylinder line is required');
@@ -1087,6 +1115,7 @@ async function updateBill(user, billId, body, stepUp = null) {
   if (newBillNumber !== undefined) bill.bill_number = newBillNumber;
   if (bill_date) bill.bill_date = bill_date;
   if (challan_no !== undefined) bill.challan_no = challan_no;
+  if (vehicle_number !== undefined) bill.vehicle_number = String(vehicle_number || '').trim().toUpperCase();
   if (transaction_type) bill.transaction_type = transaction_type;
   if (!keepLines) {
     bill.line_items = newLines;

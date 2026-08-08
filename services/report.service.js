@@ -305,6 +305,7 @@ async function getDSR(uid, { date, location }) {
             : (b.customer_id ? b.customer_id.company_name : ''),
           is_transfer: isTransfer,
           to_location: isTransfer ? b.to_location : undefined,
+          vehicle_number: b.vehicle_number || '', // Phase 27
           gas_type: gas, size,
           filled_qty: 0, empty_qty: 0, pc_in: 0, pc_out: 0, amount: 0,
           remarks: ''

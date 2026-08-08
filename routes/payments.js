@@ -1,11 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
+const validate = require('../middleware/validate');
+const V = require('../validators/schemas');
 const ctrl = require('../controllers/payments.controller');
 
 router.use(authMiddleware);
 
-router.post('/', ctrl.createPayment);
+router.post('/', validate(V.paymentCreate), ctrl.createPayment);
 router.get('/', ctrl.listPayments);
 router.put('/:id', ctrl.updatePayment);
 
