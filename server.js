@@ -41,7 +41,9 @@ const allowedOrigins = (process.env.FRONTEND_ORIGIN ||
 app.use(cors({
   origin: (origin, cb) => {
     // Allow same-origin / non-browser tools (no Origin header) and any allowed origin.
-    if (!origin || allowedOrigins.includes(origin) || /^https:\/\/([a-z0-9]+\.)?cylinderprofrontend\.pages\.dev$/.test(origin)) return cb(null, true);
+    // Phase 30: the Cloudflare Pages origin was removed — the app is served only from
+    // cylinderpro.guruindustries.co.in (set via FRONTEND_ORIGIN). No pages.dev fallback.
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
   credentials: true
