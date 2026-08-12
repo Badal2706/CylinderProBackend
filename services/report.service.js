@@ -7,7 +7,6 @@ const LocationProfile = require('../models/LocationProfile');
 const HttpError = require('../utils/HttpError');
 const { computeHoldings } = require('./holdings.service');
 const { LOCATIONS, LOCATION_LABELS } = require('../config/locations');
-const { countsByCombo } = require('./fillingLog.service');
 const { getPcStock } = require('./pcStock.service');
 const toOid = (id) => new mongoose.Types.ObjectId(id);
 
@@ -269,9 +268,12 @@ async function getDSR(uid, { date, location }) {
     bill_date: { $gte: start, $lte: end }
   };
   if (loc) {
+    // Phase 31: a site's DSR must show EVERY transfer touching it — both outgoing (this site as
+    // source) and incoming (this site as destination) — not just outgoing. Categorization below
+    // then places each into the correct columns for the physical direction at THIS site.
     query.$or = [
       { transaction_category: { $ne: 'INTERNAL_TRANSFER' }, location: loc },
-      { transaction_category: 'INTERNAL_TRANSFER', from_location: loc }
+      { transaction_category: 'INTERNAL_TRANSFER', $or: [{ from_location: loc }, { to_location: loc }] }
     ];
   } else {
     query.transaction_category = { $ne: 'INTERNAL_TRANSFER' };
@@ -286,8 +288,25 @@ async function getDSR(uid, { date, location }) {
   const rows = [];
   const totals = { filled_qty: 0, empty_qty: 0, pc_in: 0, pc_out: 0, amount: 0 };
   const transferTotals = { filled_qty: 0, empty_qty: 0, pc_in: 0, pc_out: 0, amount: 0 };
+  // Phase 32: direct Palanpur↔Chhapi transfers (neither endpoint Chandisar) don't fit the
+  // Chandisar-anchored fill/empty rule — collect them so the caller can flag them for a decision.
+  const CHANDISAR = 'AT_PLANT_CHANDISAR';
+  const flaggedTransfers = [];
   for (const b of bills) {
     const isTransfer = b.transaction_category === 'INTERNAL_TRANSFER';
+    // Phase 32 — transfer classification is anchored to Chandisar (the ONLY site that fills),
+    // NOT to which DSR is being viewed. A transfer FROM Chandisar is filled stock going out to a
+    // sub-office (→ Filled / PC Out); a transfer TO Chandisar is empties coming back for refill
+    // (→ Empty / PC In). A direct Palanpur↔Chhapi transfer fits neither and is left unclassified.
+    const fromChandisar = isTransfer && b.from_location === CHANDISAR;
+    const toChandisar = isTransfer && b.to_location === CHANDISAR;
+    const transferUnclassified = isTransfer && !fromChandisar && !toChandisar;
+    if (transferUnclassified) {
+      flaggedTransfers.push({
+        bill_id: String(b._id), bill_number: b.bill_number,
+        from_location: b.from_location, to_location: b.to_location, bill_date: b.bill_date
+      });
+    }
     const byCombo = {};
     for (const li of b.line_items) {
       const gas = li.gas_type_name || '';
@@ -297,14 +316,18 @@ async function getDSR(uid, { date, location }) {
         byCombo[key] = {
           bill_id: String(b._id),
           bill_number: b.bill_number, challan_no: b.challan_no || '',
-          // A transfer has no `location` and no customer — show where it went instead, so the
-          // row reads as "stock sent to Palanpur Office" rather than a blank customer line.
-          location: isTransfer ? b.from_location : b.location,
+          // For a transfer show the site THIS DSR is for; the ALL view never shows transfers.
+          location: isTransfer ? (loc || b.from_location) : b.location,
+          // Phase 31: name both endpoints explicitly, e.g. "Internal Transfer: Chandisar Plant → Palanpur Office".
           customer_name: isTransfer
-            ? `→ ${LOCATION_LABELS[b.to_location] || b.to_location} (Internal Transfer)`
+            ? `Internal Transfer: ${LOCATION_LABELS[b.from_location] || b.from_location} → ${LOCATION_LABELS[b.to_location] || b.to_location}`
             : (b.customer_id ? b.customer_id.company_name : ''),
           is_transfer: isTransfer,
+          from_location: isTransfer ? b.from_location : undefined,
           to_location: isTransfer ? b.to_location : undefined,
+          // OUT = filled leaving Chandisar; IN = empties returning to Chandisar; REVIEW = direct sub-office move.
+          transfer_direction: isTransfer ? (fromChandisar ? 'OUT' : toChandisar ? 'IN' : 'REVIEW') : undefined,
+          needs_review: !!transferUnclassified,
           vehicle_number: b.vehicle_number || '', // Phase 27
           gas_type: gas, size,
           filled_qty: 0, empty_qty: 0, pc_in: 0, pc_out: 0, amount: 0,
@@ -313,14 +336,24 @@ async function getDSR(uid, { date, location }) {
       }
       const r = byCombo[key];
       if (!r.remarks && li.remarks) r.remarks = li.remarks; // per-row DSR note (Phase 10)
-      if (li.direction === 'GIVEN') { r.filled_qty += li.quantity || 0; r.amount += li.amount || 0; }
-      if (li.direction === 'RECEIVED') r.empty_qty += li.quantity || 0;
-      // Internal-transfer items carry direction 'TRANSFER' — neither given nor received. Count
-      // them as the quantity moved out so the row shows a number instead of a blank 0, and note
-      // that this only ever lands in transfer_totals, never in the sales totals.
-      if (li.direction === 'TRANSFER') r.filled_qty += li.quantity || 0;
-      r.pc_in += li.personalCylindersIn || 0;   // PC taken from customer
-      r.pc_out += li.personalCylindersOut || 0; // PC returned (refilled) to customer
+      if (isTransfer) {
+        // Phase 32 — Chandisar-anchored (see above). Only Chandisar fills, so its outgoing
+        // transfers are always Filled/PC Out and its incoming ones always Empty/PC In.
+        const pcMoved = li.personalCylindersIn || 0; // transfer PC lines store qty here
+        if (fromChandisar) {
+          if (li.serial_number) r.filled_qty += li.quantity || 0;
+          r.pc_out += pcMoved;
+        } else if (toChandisar) {
+          if (li.serial_number) r.empty_qty += li.quantity || 0;
+          r.pc_in += pcMoved;
+        }
+        // Unclassified (Palanpur↔Chhapi): leave Filled/Empty/PC blank; the row is flagged above.
+      } else {
+        if (li.direction === 'GIVEN') { r.filled_qty += li.quantity || 0; r.amount += li.amount || 0; }
+        if (li.direction === 'RECEIVED') r.empty_qty += li.quantity || 0;
+        r.pc_in += li.personalCylindersIn || 0;   // PC taken from customer (arrives empty)
+        r.pc_out += li.personalCylindersOut || 0; // PC returned (refilled) to customer (leaves filled)
+      }
     }
     Object.values(byCombo).forEach(r => {
       rows.push(r);
@@ -350,18 +383,12 @@ async function getDSR(uid, { date, location }) {
     reporting_person,
     rows,
     totals,
-    transfer_totals: transferTotals
+    transfer_totals: transferTotals,
+    // Phase 32: direct Palanpur↔Chhapi transfers that the Chandisar-anchored rule can't classify.
+    flagged_transfers: flaggedTransfers
   };
 }
 
-// ─── Phase 5: Stock Summary (Filled + Empty tables per location per day) ───
-// Best-effort model (revisit after use):
-//   • Every cylinder movement comes from bills (customer GIVEN/RECEIVED, internal TRANSFER).
-//   • A cylinder counts as EMPTY while its most recent event is a customer return (RECEIVED);
-//     otherwise FILLED (fresh imports and transfer-dispatched cylinders are assumed filled;
-//     Chandisar refills happen implicitly at give-out since no fill event exists in the data).
-//   • Opening/Closing are replayed states at the day's boundaries; Add/Issue-Receive are the
-//     day's actual movements at that site.
 // Gas grouping merges O2/MO2/Medical Oxygen into "Oxygen"; blank capacity defaults to 7 m3.
 function stockGasKey(name) {
   const n = String(name || '').trim().toUpperCase();
@@ -370,137 +397,176 @@ function stockGasKey(name) {
 }
 const stockCapKey = (cap) => String(cap || '').trim() || '7 m3';
 
+// ─── Stock Summary (Phase 32 rebuild — independent per-location ledger) ───
+// Serialized cylinders ONLY (personal cylinders live in their own section, never here).
+// Each site keeps two running ledgers (Filled, Empty) where Closing = Opening + In − Out and
+// Opening[day] = Closing[day-1]. Both invariants hold BY CONSTRUCTION: we anchor Closing(today)
+// to the actual current physical stock, then derive any requested day's Closing by backing out
+// the net movements that happened AFTER it, and its Opening by further backing out that day's
+// own movements. So the split between days is exact regardless of the absolute anchor.
+//
+// Movement classification is anchored to Chandisar — the ONLY site that fills cylinders:
+//   Chandisar Filled:  In  = filled on-site today + filled cylinders returned from filling vendors
+//                      Out = filled given to (non-vendor) customers + filled transferred out to sub-offices
+//   Chandisar Empty:   In  = empties returned by customers + empties transferred in from sub-offices
+//                      Out = filled on-site today (leaves the empty pool) + empties sent to filling vendors
+//   Palanpur/Chhapi Filled: In = filled transferred in from Chandisar; Out = filled given to customers
+//   Palanpur/Chhapi Empty:  In = empties returned by customers;       Out = empties transferred to Chandisar
+// (Sub-offices never fill, so their Filled "In" is only transfers-in; direct sub-office↔sub-office
+//  transfers don't fit the model and are ignored here — the DSR flags them for a decision.)
 async function getStockSummary(uid, { date, location }) {
   if (!LOCATIONS.includes(location)) throw new HttpError(400, 'A valid location is required');
+  const CHANDISAR = 'AT_PLANT_CHANDISAR';
+  const isChandisar = location === CHANDISAR;
+  const FillingLogEntry = require('../models/FillingLogEntry');
+
   const day = date ? new Date(date) : new Date();
   const start = new Date(day); start.setHours(0, 0, 0, 0);
   const end = new Date(day); end.setHours(23, 59, 59, 999);
+  const y = start.getFullYear(), mo = String(start.getMonth() + 1).padStart(2, '0'), d = String(start.getDate()).padStart(2, '0');
+  const dayStr = `${y}-${mo}-${d}`; // filling-log dates are 'YYYY-MM-DD' strings
 
-  const [cylinders, bills] = await Promise.all([
+  const [cylinders, bills, vendors, fills] = await Promise.all([
     Cylinder.find({ user_id: uid }, { rotational_number: 1, gas_type: 1, capacity: 1, location: 1, stock_state: 1 }).lean(),
     Bill.find({ user_id: uid, is_draft: { $ne: true } },
       { bill_date: 1, location: 1, from_location: 1, to_location: 1, customer_id: 1,
         transaction_category: 1, 'line_items.serial_number': 1, 'line_items.direction': 1,
         'line_items.gas_type_name': 1, 'line_items.size_label': 1, 'line_items.quantity': 1 }
-    ).sort('bill_date createdAt').lean()
+    ).sort('bill_date createdAt').lean(),
+    Customer.find({ user_id: uid, is_filling_vendor: true }, { _id: 1 }).lean(),
+    FillingLogEntry.find({ user_id: uid }, { date: 1, gas_type: 1, capacity: 1, rotational_number: 1 }).lean()
   ]);
+  const vendorIds = new Set(vendors.map(v => String(v._id)));
 
-  // Chronological event list per rotational number.
-  const events = {}; // serial -> [{ t, type, loc, from, to }]
-  for (const b of bills) {
-    for (const li of b.line_items) {
-      if (!li.serial_number) continue;
-      const list = events[li.serial_number] || (events[li.serial_number] = []);
-      if (li.direction === 'TRANSFER') list.push({ t: b.bill_date, type: 'TRANSFER', from: b.from_location, to: b.to_location });
-      else list.push({ t: b.bill_date, type: li.direction, loc: b.location });
-    }
-  }
-
-  // State of one cylinder at time T: undo every event after T starting from its current doc.
-  const stateAt = (c, T) => {
-    const evts = events[c.rotational_number] || [];
-    let loc = c.location;
-    let inStock = c.stock_state === 'IN_STOCK';
-    for (let i = evts.length - 1; i >= 0; i--) {
-      const e = evts[i];
-      if (new Date(e.t) <= T) break;
-      if (e.type === 'TRANSFER') loc = e.from;
-      else if (e.type === 'GIVEN') { inStock = true; if (e.loc) loc = e.loc; }
-      else if (e.type === 'RECEIVED') { inStock = false; }
-    }
-    // Empty while the last event ≤ T is a customer return.
-    let last = null;
-    for (const e of evts) { if (new Date(e.t) <= T) last = e; else break; }
-    const empty = !!last && last.type === 'RECEIVED';
-    return { loc, inStock, empty };
-  };
-
-  const table = {}; // gas|cap -> { gas, capacity, filled:{opening,add,issue,closing}, empty:{opening,receive,issue,closing} }
+  const table = {};
   const rowFor = (gas, cap) => {
     const key = gas + '|' + cap;
     if (!table[key]) {
       table[key] = {
         gas_type: gas, capacity: cap,
-        filled: { opening: 0, add: 0, issue: 0, closing: 0 },
-        empty: { opening: 0, receive: 0, issue: 0, closing: 0 }
+        // in/out split into onDay vs afterDay so Opening/Closing back out cleanly from the anchor.
+        _f: { anchor: 0, inOn: 0, outOn: 0, inAfter: 0, outAfter: 0 },
+        _e: { anchor: 0, inOn: 0, outOn: 0, inAfter: 0, outAfter: 0 }
       };
     }
     return table[key];
   };
+  const addF = (gas, cap, field, n) => { rowFor(gas, cap)._f[field] += n; };
+  const addE = (gas, cap, field, n) => { rowFor(gas, cap)._e[field] += n; };
 
-  const openingT = new Date(start.getTime() - 1);
-  for (const c of cylinders) {
-    const gas = stockGasKey(c.gas_type), cap = stockCapKey(c.capacity);
-    const open = stateAt(c, openingT);
-    const close = stateAt(c, end);
-    if (open.inStock && open.loc === location) rowFor(gas, cap)[open.empty ? 'empty' : 'filled'].opening++;
-    if (close.inStock && close.loc === location) rowFor(gas, cap)[close.empty ? 'empty' : 'filled'].closing++;
-
-    // Day movements at this site for this cylinder.
-    const evts = events[c.rotational_number] || [];
-    for (const e of evts) {
-      const t = new Date(e.t);
-      if (t < start || t > end) continue;
-      const r = rowFor(gas, cap);
-      if (e.type === 'GIVEN' && e.loc === location) r.filled.issue++;           // issued (filled) to customer
-      else if (e.type === 'RECEIVED' && e.loc === location) r.empty.receive++;  // came back empty
-      else if (e.type === 'TRANSFER') {
-        // Classify the transferred cylinder by its state just before the transfer.
-        const before = stateAt(c, new Date(t.getTime() - 1));
-        if (e.to === location) r[before.empty ? 'empty' : 'filled'][before.empty ? 'receive' : 'add']++;
-        if (e.from === location) r[before.empty ? 'empty' : 'filled'].issue++;
+  // ── Anchor: current physical stock in-stock AT this location, split filled/empty. ──
+  // A cylinder is EMPTY when its most recent event left it empty: a customer RETURN (RECEIVED),
+  // or a transfer INTO Chandisar (empties returned by a sub-office, awaiting refill). It is
+  // FILLED after an on-site FILL (filling log), a transfer OUT of Chandisar (filled stock sent
+  // to a sub-office), or when it has no history (fresh import assumed filled). This is the site's
+  // true current stock = Closing(today).
+  const lastEvt = {}; // serial -> { t, empty }
+  const bump = (serial, t, empty) => {
+    const cur = lastEvt[serial];
+    if (!cur || new Date(t) >= new Date(cur.t)) lastEvt[serial] = { t, empty };
+  };
+  for (const b of bills) {
+    for (const li of b.line_items) {
+      if (!li.serial_number) continue;
+      if (b.transaction_category === 'INTERNAL_TRANSFER') {
+        if (b.to_location === CHANDISAR) bump(li.serial_number, b.bill_date, true);        // empties back to plant
+        else if (b.from_location === CHANDISAR) bump(li.serial_number, b.bill_date, false); // filled sent out
+        // sub-office↔sub-office: leave state unchanged
+      } else {
+        bump(li.serial_number, b.bill_date, li.direction === 'RECEIVED'); // returned empty vs given filled
       }
     }
   }
+  // Filling-log fills mark a cylinder filled; dated end-of-day so a same-day fill beats a same-day transfer-in.
+  for (const f of fills) {
+    if (!f.rotational_number) continue;
+    bump(f.rotational_number, new Date(`${f.date}T23:59:59.500`), false);
+  }
+  for (const c of cylinders) {
+    if (c.stock_state !== 'IN_STOCK' || c.location !== location) continue;
+    const gas = stockGasKey(c.gas_type), cap = stockCapKey(c.capacity);
+    const empty = !!(lastEvt[c.rotational_number] && lastEvt[c.rotational_number].empty);
+    if (empty) addE(gas, cap, 'anchor', 1); else addF(gas, cap, 'anchor', 1);
+  }
 
-  // Chandisar's Filled "Add" is "Filled Today" from the daily filling log (Phase 11) —
-  // Chandisar never receives filled stock from elsewhere, it fills on-site. Other locations
-  // keep transfers-in as their Add figure.
-  const isChandisar = location === 'AT_PLANT_CHANDISAR';
-  if (isChandisar) {
-    const y = start.getFullYear(), m = String(start.getMonth() + 1).padStart(2, '0'), d = String(start.getDate()).padStart(2, '0');
-    const fillCounts = await countsByCombo(uid, `${y}-${m}-${d}`);
-    Object.values(table).forEach(r => { r.filled.add = 0; });
-    for (const [key, n] of Object.entries(fillCounts)) {
-      const [g, cap] = key.split('|');
-      rowFor(stockGasKey(g), stockCapKey(cap)).filled.add = n;
-    }
-
-    // Empty Stock "Issue" (Phase 12) = empties leaving the empty pool that day:
-    //   (a) cylinders sent to filling-vendor customers (GIVEN quantities on vendor bills), plus
-    //   (b) the day's Filling List entries (filled on-site — same data as "Filled Today" above,
-    //       so the two rows stay in sync by construction).
-    const vendors = await Customer.find({ user_id: uid, is_filling_vendor: true }, { _id: 1 });
-    const vendorIds = new Set(vendors.map(v => String(v._id)));
-    Object.values(table).forEach(r => { r.empty.issue = 0; });
-    for (const [key, n] of Object.entries(fillCounts)) {
-      const [g, cap] = key.split('|');
-      rowFor(stockGasKey(g), stockCapKey(cap)).empty.issue += n;
-    }
-    if (vendorIds.size) {
-      for (const b of bills) {
-        if (b.transaction_category === 'INTERNAL_TRANSFER') continue;
-        if (b.location !== location) continue;
-        const t = new Date(b.bill_date);
-        if (t < start || t > end) continue;
-        if (!b.customer_id || !vendorIds.has(String(b.customer_id))) continue;
-        for (const li of b.line_items) {
-          if (li.direction !== 'GIVEN' || !(li.quantity > 0)) continue;
-          rowFor(stockGasKey(li.gas_type_name), stockCapKey(li.size_label)).empty.issue += li.quantity;
+  // ── Movements from bills (serialized lines only). Bucket each into on-day vs after-day. ──
+  const bucketOf = (t) => { const dt = new Date(t); if (dt >= start && dt <= end) return 'On'; if (dt > end) return 'After'; return null; };
+  for (const b of bills) {
+    const bkt = bucketOf(b.bill_date);
+    if (!bkt) continue; // before the requested day — already folded into the anchor
+    const isTransfer = b.transaction_category === 'INTERNAL_TRANSFER';
+    if (isTransfer) {
+      const from = b.from_location, to = b.to_location;
+      // Only transfers with a Chandisar endpoint are classified (sub-office↔sub-office ignored).
+      const touchesHereChandisar = isChandisar && (from === CHANDISAR || to === CHANDISAR);
+      const touchesHereSub = !isChandisar && ((from === location && to === CHANDISAR) || (to === location && from === CHANDISAR));
+      if (!touchesHereChandisar && !touchesHereSub) continue;
+      for (const li of b.line_items) {
+        if (!li.serial_number) continue; // serialized only
+        const qty = li.quantity || 0; if (!qty) continue;
+        const gas = stockGasKey(li.gas_type_name), cap = stockCapKey(li.size_label);
+        if (isChandisar) {
+          if (from === CHANDISAR) addF(gas, cap, 'out' + bkt, qty);       // filled out to a sub-office
+          else if (to === CHANDISAR) addE(gas, cap, 'in' + bkt, qty);     // empties back for refill
+        } else {
+          if (to === location && from === CHANDISAR) addF(gas, cap, 'in' + bkt, qty);   // filled arrives
+          else if (from === location && to === CHANDISAR) addE(gas, cap, 'out' + bkt, qty); // empties sent to Chandisar
+        }
+      }
+    } else {
+      if (b.location !== location) continue;
+      const isVendor = b.customer_id && vendorIds.has(String(b.customer_id));
+      for (const li of b.line_items) {
+        if (!li.serial_number) continue; // serialized only
+        const qty = li.quantity || 0; if (!qty) continue;
+        const gas = stockGasKey(li.gas_type_name), cap = stockCapKey(li.size_label);
+        if (li.direction === 'GIVEN') {
+          if (isChandisar && isVendor) addE(gas, cap, 'out' + bkt, qty);  // empties sent to filling vendor
+          else addF(gas, cap, 'out' + bkt, qty);                          // filled given to customer
+        } else if (li.direction === 'RECEIVED') {
+          if (isChandisar && isVendor) addF(gas, cap, 'in' + bkt, qty);   // vendor returns filled
+          else addE(gas, cap, 'in' + bkt, qty);                           // empty back from customer
         }
       }
     }
   }
 
-  const rows = Object.values(table).sort((a, b) =>
-    a.gas_type === b.gas_type ? a.capacity.localeCompare(b.capacity) : a.gas_type.localeCompare(b.gas_type));
+  // ── Filling log (Chandisar only): each fill adds to Filled In and removes from Empty (Out). ──
+  if (isChandisar) {
+    for (const f of fills) {
+      const bkt = f.date === dayStr ? 'On' : (f.date > dayStr ? 'After' : null);
+      if (!bkt) continue;
+      const gas = stockGasKey(f.gas_type), cap = stockCapKey(f.capacity);
+      addF(gas, cap, 'in' + bkt, 1);   // filled today → enters filled pool
+      addE(gas, cap, 'out' + bkt, 1);  // …and leaves the empty pool
+    }
+  }
+
+  // ── Resolve each ledger: Closing(today)=anchor; back out after-day and on-day movements. ──
+  const rows = Object.values(table).map(r => {
+    const resolve = (m) => {
+      const closing = m.anchor - (m.inAfter - m.outAfter);
+      const opening = closing - (m.inOn - m.outOn);
+      return { opening, in: m.inOn, out: m.outOn, closing };
+    };
+    const f = resolve(r._f), e = resolve(r._e);
+    return {
+      gas_type: r.gas_type, capacity: r.capacity,
+      filled: { opening: f.opening, add: f.in, issue: f.out, closing: f.closing },
+      empty: { opening: e.opening, receive: e.in, issue: e.out, closing: e.closing }
+    };
+  }).filter(r => // drop all-zero rows (no stock and no movement for this combo on/around this day)
+    r.filled.opening || r.filled.add || r.filled.issue || r.filled.closing ||
+    r.empty.opening || r.empty.receive || r.empty.issue || r.empty.closing
+  ).sort((a, b) => a.gas_type === b.gas_type ? a.capacity.localeCompare(b.capacity) : a.gas_type.localeCompare(b.gas_type));
 
   return {
     date: start,
     location,
     location_label: LOCATION_LABELS[location],
-    filled_add_label: isChandisar ? 'Filled Today' : 'Add (Transfers In)',
-    empty_issue_label: isChandisar ? 'Issue (Filled Today + Sent to Vendors)' : 'Issue (Transfers Out)',
+    // Sub-offices never fill — their Filled "In" is purely transfers received from Chandisar.
+    filled_add_label: isChandisar ? 'Filled Today' : 'Add (Transfers In from Chandisar)',
+    empty_issue_label: isChandisar ? 'Issue (Filled Today + Sent to Vendors)' : 'Issue (Transfers Out to Chandisar)',
     rows
   };
 }

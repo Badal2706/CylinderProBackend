@@ -104,17 +104,69 @@ async function assertPersonalPerCombo(owner, customerId, newLines, excludeBillId
   }
 }
 
-// Bill numbers are globally sequential (not per-user). bill_number is user-editable,
-// so derive the next sequence from the highest existing BILL-#### value (custom-format
-// numbers are ignored) instead of trusting the most recent bill.
+// ─── Auto-generated default Bill Number series (Phase 31) ───
+// Sequence: 1A001, 1A002 … 1A999, 1B001 … 1Z999, 2A001 … The cycle number increments
+// only after Z999. bill_number stays lifelong freely editable — this only changes the
+// DEFAULT prefilled suggestion; every historical number (BILL-####, GST-####, …) is left
+// exactly as stored. A persistent Counter (global, since bill_number is globally unique)
+// tracks the highest series index issued so the very next default is 1A001.
+const SERIES_RE = /^(\d+)([A-Z])(\d{3})$/;
+const COUNTER_KEY = 'bill_number_series';
+const NUMS_PER_BLOCK = 999;       // 001..999 within one letter
+const BLOCKS_PER_CYCLE = 26;      // A..Z within one cycle
+
+// 1-based sequence index → series string. n=1 → "1A001".
+function seqToBillNumber(n) {
+  const idx0 = n - 1;
+  const number = (idx0 % NUMS_PER_BLOCK) + 1;              // 1..999
+  const blockIdx = Math.floor(idx0 / NUMS_PER_BLOCK);
+  const letter = String.fromCharCode(65 + (blockIdx % BLOCKS_PER_CYCLE)); // A..Z
+  const cycle = 1 + Math.floor(blockIdx / BLOCKS_PER_CYCLE);
+  return `${cycle}${letter}${String(number).padStart(3, '0')}`;
+}
+
+// Series string → 1-based sequence index (null if not in the series format).
+function billNumberToSeq(str) {
+  const m = SERIES_RE.exec(String(str || '').trim());
+  if (!m) return null;
+  const cycle = parseInt(m[1], 10);
+  const letterIdx = m[2].charCodeAt(0) - 65;
+  const number = parseInt(m[3], 10);
+  if (cycle < 1 || number < 1 || number > 999) return null;
+  const blockIdx = (cycle - 1) * BLOCKS_PER_CYCLE + letterIdx;
+  return blockIdx * NUMS_PER_BLOCK + number;
+}
+
+// PEEK the next default without consuming it (prefill on the form — a suggestion the user
+// may edit or discard, so it must be idempotent). Skips any series value already taken by a
+// real or draft bill so the suggestion never collides with a manually-entered future number.
+async function peekNextBillNumber() {
+  const Counter = require('../models/Counter');
+  const c = await Counter.findOne({ key: COUNTER_KEY });
+  let n = ((c && c.seq) || 0) + 1;
+  for (let guard = 0; guard < 100000; guard++) {
+    const candidate = seqToBillNumber(n);
+    const clash = await Bill.exists({ bill_number: candidate });
+    if (!clash) return candidate;
+    n++;
+  }
+  return seqToBillNumber(n);
+}
+
+// Advance the persistent counter past a just-used bill number (keeps it monotonic whether the
+// user accepted the prefilled suggestion, typed a different in-series number, or a draft
+// reserved one). Out-of-series numbers (BILL-####, GST-####, …) leave the counter untouched.
+async function advanceCounterPast(billNumber) {
+  const seq = billNumberToSeq(billNumber);
+  if (seq == null) return;
+  const Counter = require('../models/Counter');
+  await Counter.updateOne({ key: COUNTER_KEY }, { $max: { seq } }, { upsert: true });
+}
+
+// Back-compat alias: callers that just want "the next default number" (drafts, transfer
+// fallback) peek the series. Consumption is finalized via advanceCounterPast after save.
 async function generateBillNumber() {
-  const result = await Bill.aggregate([
-    { $match: { bill_number: /^BILL-\d+$/ } },
-    { $project: { num: { $toInt: { $arrayElemAt: [{ $split: ['$bill_number', '-'] }, 1] } } } },
-    { $group: { _id: null, max: { $max: '$num' } } }
-  ]);
-  const maxId = (result.length && result[0].max) || 0;
-  return `BILL-${String(maxId + 1).padStart(4, '0')}`;
+  return peekNextBillNumber();
 }
 
 // Find the current holder of a cylinder = the most recent GIVEN line for that rotational number
@@ -441,6 +493,7 @@ async function createInternalTransfer(userId, body) {
 
   await bill.save(); // post-save hook moves cylinder locations
 
+  try { await advanceCounterPast(bill.bill_number); } catch (e) { /* non-fatal */ } // Phase 31
   try { await recomputeLocationPcStock(userId); } catch (e) { /* non-fatal */ }
 
   return {
@@ -784,6 +837,10 @@ async function createBill(userId, body, stepUp = null) {
   });
 
   await bill.save();
+
+  // Advance the series counter past this number (Phase 31) — whether it was the prefilled
+  // suggestion the user accepted or an in-series number they typed. No-op for custom formats.
+  try { await advanceCounterPast(billNumber); } catch (e) { /* non-fatal */ }
 
   // Record the over-limit authorization (Phase 18): who approved and how, on the bill and
   // in the audit log. updateOne so the cylinder-sync hook doesn't run a second time.
@@ -1320,6 +1377,9 @@ async function saveDraft(userId, { draft_id, location, payload }) {
     });
   }
   await draft.save(); // hook is a no-op for drafts
+
+  // A new draft reserves a real series number — advance the counter so it isn't re-issued (Phase 31).
+  if (!draft_id) { try { await advanceCounterPast(draft.bill_number); } catch (e) { /* non-fatal */ } }
 
   return { draft_id: draft._id, bill_number: draft.bill_number, message: 'Draft saved' };
 }
