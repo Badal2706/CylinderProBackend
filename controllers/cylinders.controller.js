@@ -1,5 +1,6 @@
 const asyncHandler = require('../middleware/asyncHandler');
 const cylinderService = require('../services/cylinder.service');
+const cylinderHistoryService = require('../services/cylinderHistory.service');
 
 exports.getAgingReport = asyncHandler(async (req, res) => {
   res.json(await cylinderService.getAgingReport(req.user.id, req.query));
@@ -15,6 +16,10 @@ exports.listInRotation = asyncHandler(async (req, res) => {
 
 exports.getCylinder = asyncHandler(async (req, res) => {
   res.json(await cylinderService.getCylinder(req.user.id, req.params.id));
+});
+
+exports.getCylinderHistory = asyncHandler(async (req, res) => {
+  res.json(await cylinderHistoryService.getHistory(req.user.id, req.params.id));
 });
 
 exports.createCylinder = asyncHandler(async (req, res) => {

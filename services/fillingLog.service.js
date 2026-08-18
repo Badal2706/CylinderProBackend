@@ -4,6 +4,28 @@ const HttpError = require('../utils/HttpError');
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+// Phase 33: log-only FILLED history. A fill NEVER touches a cylinder's location/stock_state
+// (Phase 32 invariant) — this only records the event alongside the filling log. Non-fatal.
+// items: [{ cylinderId, rotational_number, date }] for entries that matched a real cylinder.
+async function logFillHistory(userId, items) {
+  const list = (items || []).filter(it => it && it.cylinderId);
+  if (!list.length) return;
+  try {
+    const cylHistory = require('./cylinderHistory.service');
+    const mgrMap = await cylHistory.getManagerMap(userId);
+    const performer = mgrMap['AT_PLANT_CHANDISAR'] || '';
+    await cylHistory.logEvents(list.map(it => ({
+      user_id: userId, cylinder_id: it.cylinderId, rotational_number: it.rotational_number,
+      event_type: 'FILLED',
+      description: `Filled at Chandisar Plant on ${it.date}`,
+      performed_by: performer, performed_at_location: 'AT_PLANT_CHANDISAR',
+      // event_at = the fill's day (the real event time); the entry's createdAt records when it was
+      // typed. History shows both (Phase 34 item 5).
+      event_at: new Date(it.date)
+    })));
+  } catch (e) { /* non-fatal */ }
+}
+
 // Add one filling entry. If a rotational number is given and matches inventory, gas/size are
 // auto-filled from the cylinder; otherwise gas_type + capacity must be supplied explicitly.
 // Deliberately NO side effects on Cylinder or Bill records (Phase 11 invariant).
@@ -12,12 +34,14 @@ async function addEntry(userId, { date, rotational_number, gas_type, capacity })
   const rot = String(rotational_number || '').trim();
   let gas = String(gas_type || '').trim();
   let cap = String(capacity || '').trim();
+  let matched = null;
   if (rot) {
     const cyl = await Cylinder.findOne({ user_id: userId, rotational_number: rot });
-    if (cyl) { gas = cyl.gas_type; cap = cyl.capacity; }
+    if (cyl) { gas = cyl.gas_type; cap = cyl.capacity; matched = cyl; }
   }
   if (!gas || !cap) throw new HttpError(400, 'Gas type and capacity are required (or a cylinder number that exists in inventory)');
   const entry = await FillingLogEntry.create({ user_id: userId, date, rotational_number: rot, gas_type: gas, capacity: cap });
+  if (matched) await logFillHistory(userId, [{ cylinderId: matched._id, rotational_number: rot, date }]);
   return { entry_id: entry._id, gas_type: gas, capacity: cap, message: 'Filling entry recorded' };
 }
 
@@ -57,6 +81,7 @@ async function saveDay(userId, { date, entries }) {
   if (!Array.isArray(entries)) throw new HttpError(400, 'entries must be an array');
 
   const docs = [];
+  const fills = []; // Phase 33: entries that matched a real cylinder → FILLED history (log-only)
   for (let i = 0; i < entries.length; i++) {
     const raw = entries[i] || {};
     const rot = String(raw.rotational_number || '').trim();
@@ -64,7 +89,7 @@ async function saveDay(userId, { date, entries }) {
     let cap = String(raw.capacity || '').trim();
     if (rot) {
       const cyl = await Cylinder.findOne({ user_id: userId, rotational_number: rot });
-      if (cyl) { gas = cyl.gas_type; cap = cyl.capacity; }
+      if (cyl) { gas = cyl.gas_type; cap = cyl.capacity; fills.push({ cylinderId: cyl._id, rotational_number: rot, date }); }
     }
     if (!gas || !cap) {
       throw new HttpError(400, `Entry ${i + 1}: gas type and capacity are required (or a cylinder number that exists in inventory)`);
@@ -74,6 +99,7 @@ async function saveDay(userId, { date, entries }) {
 
   await FillingLogEntry.deleteMany({ user_id: userId, date });
   if (docs.length) await FillingLogEntry.insertMany(docs);
+  await logFillHistory(userId, fills);
   return listEntries(userId, date);
 }
 

@@ -3,8 +3,11 @@ const Bill = require('../models/Bill');
 const HttpError = require('../utils/HttpError');
 const { normalizeGasTypeIn, normalizeCapacityIn } = require('../config/gasCapacities');
 const { getGasCapacities } = require('./masters.service');
-const { LOCATIONS } = require('../config/locations');
+const { LOCATIONS, LOCATION_LABELS } = require('../config/locations');
 const { insertInBatches } = require('../utils/bulkInsert');
+
+// Human labels for the manual-edit history description.
+const STATE_LABEL = { IN_STOCK: 'In Stock', AT_CUSTOMER: 'At Customer' };
 
 // Accept friendly location spellings from forms/imports → canonical enum (or null if invalid).
 function normalizeLocation(v) {
@@ -371,15 +374,18 @@ async function updateCylinder(uid, id, body) {
   }
   const mutation = Object.keys(unset).length ? { $set: updates, $unset: unset } : updates;
 
+  // Read the pre-edit doc once — used both by the type-edit gate (Phase 9) and by the
+  // manual-edit history log (Phase 33), which needs the old location/stock_state values.
+  const before = await Cylinder.findOne({ _id: id, user_id: uid });
+  if (!before) throw new HttpError(404, 'Cylinder not found');
+
   // ─── Gas-type / capacity edit gate (Phase 9) ───
   // Same gate as the maintenance toggle: the cylinder must be IN_STOCK at Chandisar Plant.
   // Historical bills are unaffected either way — their line items carry name snapshots.
   if (updates.gas_type !== undefined || updates.capacity !== undefined) {
-    const current = await Cylinder.findOne({ _id: id, user_id: uid });
-    if (!current) throw new HttpError(404, 'Cylinder not found');
-    const changingType = (updates.gas_type !== undefined && updates.gas_type !== current.gas_type) ||
-                         (updates.capacity !== undefined && updates.capacity !== current.capacity);
-    if (changingType && (current.location !== 'AT_PLANT_CHANDISAR' || current.stock_state !== 'IN_STOCK')) {
+    const changingType = (updates.gas_type !== undefined && updates.gas_type !== before.gas_type) ||
+                         (updates.capacity !== undefined && updates.capacity !== before.capacity);
+    if (changingType && (before.location !== 'AT_PLANT_CHANDISAR' || before.stock_state !== 'IN_STOCK')) {
       throw new HttpError(400, 'Gas type / capacity can only be changed while the cylinder is In Stock at Chandisar Plant.');
     }
   }
@@ -396,6 +402,47 @@ async function updateCylinder(uid, id, body) {
   }
 
   if (!cylinder) throw new HttpError(404, 'Cylinder not found');
+
+  // ─── Phase 33: log manual edits to location / stock_state (never via a transaction) ───
+  // Purely additive; a logging failure never fails the edit. "Performed by" resolves from the
+  // active session's location (sent by the Cylinder Inventory edit form), falling back to Chandisar.
+  try {
+    const diffs = [];
+    if (updates.location !== undefined && cylinder.location !== before.location) {
+      diffs.push({
+        field: 'Location',
+        from: LOCATION_LABELS[before.location] || before.location,
+        to: LOCATION_LABELS[cylinder.location] || cylinder.location,
+        from_location: before.location, to_location: cylinder.location
+      });
+    }
+    if (updates.stock_state !== undefined && cylinder.stock_state !== before.stock_state) {
+      diffs.push({
+        field: 'Stock State',
+        from: STATE_LABEL[before.stock_state] || before.stock_state,
+        to: STATE_LABEL[cylinder.stock_state] || cylinder.stock_state,
+        from_state: before.stock_state, to_state: cylinder.stock_state
+      });
+    }
+    if (diffs.length) {
+      const cylHistory = require('./cylinderHistory.service');
+      const activeLoc = LOCATIONS.includes(body.active_location) ? body.active_location : 'AT_PLANT_CHANDISAR';
+      const mgrMap = await cylHistory.getManagerMap(uid);
+      const performer = mgrMap[activeLoc] || '';
+      const who = performer || (LOCATION_LABELS[activeLoc] || activeLoc);
+      const locLabel = LOCATION_LABELS[activeLoc] || activeLoc;
+      const now = new Date();
+      await cylHistory.logEvents(diffs.map(d => ({
+        user_id: uid, cylinder_id: cylinder._id, rotational_number: cylinder.rotational_number,
+        event_type: 'MANUAL_EDIT',
+        description: `${who} at ${locLabel} changed ${d.field} from ${d.from} to ${d.to}`,
+        from_location: d.from_location || '', to_location: d.to_location || '',
+        from_state: d.from_state || '', to_state: d.to_state || '',
+        performed_by: performer, performed_at_location: activeLoc, event_at: now
+      })));
+    }
+  } catch (e) { /* non-fatal */ }
+
   return { cylinder_id: cylinder._id, message: 'Cylinder updated successfully' };
 }
 

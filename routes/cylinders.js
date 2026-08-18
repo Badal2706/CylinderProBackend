@@ -12,6 +12,7 @@ router.use(authMiddleware);
 router.get('/aging-report', ctrl.getAgingReport);
 router.get('/', ctrl.listCylinders);
 router.get('/in-rotation', ctrl.listInRotation);
+router.get('/:id/history', ctrl.getCylinderHistory);
 router.get('/:id', ctrl.getCylinder);
 router.post('/', validate(V.cylinderCreate), ctrl.createCylinder);
 router.post('/import', validate(V.importRows), ctrl.importCylinders);

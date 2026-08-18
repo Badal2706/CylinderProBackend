@@ -7,6 +7,7 @@ const HttpError = require('../utils/HttpError');
 const { LOCATIONS, LOCATION_LABELS } = require('../config/locations');
 const { computeHoldings } = require('./holdings.service');
 const { recomputeLocationPcStock } = require('./pcStock.service');
+const { recomputeCylinderState, stateAsOf } = require('./cylinderState.service');
 const audit = require('./audit.service');
 
 // Edit/Delete window (Phase 5): bills are mutable for 3 days from their CREATION timestamp
@@ -495,6 +496,26 @@ async function createInternalTransfer(userId, body) {
 
   try { await advanceCounterPast(bill.bill_number); } catch (e) { /* non-fatal */ } // Phase 31
   try { await recomputeLocationPcStock(userId); } catch (e) { /* non-fatal */ }
+  // Phase 34: authoritative state = full-history replay (keeps backdated/out-of-order transfers correct).
+  try { await recomputeCylinderState(userId, serials); } catch (e) { /* non-fatal */ }
+
+  // ─── Phase 33: per-cylinder history (log-only; the post-save hook owns the actual move) ───
+  try {
+    const cylHistory = require('./cylinderHistory.service');
+    const mgrMap = await cylHistory.getManagerMap(userId);
+    const performer = mgrMap[from_location] || '';
+    const fromLabel = LOCATION_LABELS[from_location] || from_location;
+    const toLabel = LOCATION_LABELS[to_location] || to_location;
+    const now = new Date();
+    await cylHistory.logEvents(serials.map(s => ({
+      user_id: userId, cylinder_id: byRot[s]._id, rotational_number: s,
+      event_type: 'TRANSFER',
+      description: `Transferred from ${fromLabel} to ${toLabel}`,
+      from_location, to_location, from_state: 'IN_STOCK', to_state: 'IN_STOCK',
+      document_ref: bill.bill_number,
+      performed_by: performer, performed_at_location: from_location, event_at: bill.bill_date
+    })));
+  } catch (e) { /* non-fatal */ }
 
   return {
     bill_id: bill._id,
@@ -632,32 +653,95 @@ async function createBill(userId, body, stepUp = null) {
     }
   }
 
+  // ─── Phase 34: date-aware availability validation ───
+  // Validate each cylinder against its state AS OF the bill's date+time (replay of real bills dated
+  // on/before it), not its live current state. For a same-day entry asOf ≈ now, so the replay equals
+  // the live state and behaviour is unchanged. Backdated entries validate against real history.
+  const asOf = bill_date ? new Date(bill_date) : new Date();
+  const fmtDT = (d) => new Date(d).toLocaleString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const givenSet = new Set(givenSerials);
+  const confirmPre = !!body.confirm_pre_software;
+  const preSoftware = []; // cylinders whose ONLY contradiction is the Phase 33 migration placeholder
+
+  // The migration snapshot (Phase 33 placeholder): the cylinder's earliest software record. When no
+  // genuine bill precedes the entry, this is all we can check against — and a backdated entry that
+  // predates it may legitimately contradict it (genuine pre-software history).
+  const CylinderHistory = require('../models/CylinderHistory');
+  async function migSnapshot(rot) {
+    const cyl = cylByRot[rot];
+    const m = cyl ? await CylinderHistory.findOne({ user_id: userId, cylinder_id: cyl._id, event_type: 'MIGRATED' }).lean() : null;
+    if (m) return { loc: m.to_location || '', state: m.to_state || '', at: m.event_at ? new Date(m.event_at) : null };
+    return { loc: cyl ? cyl.location : '', state: cyl ? cyl.stock_state : '', at: null }; // no placeholder → fall back to live
+  }
+  const snapText = (m) => `${LOCATION_LABELS[m.loc] || m.loc || 'unknown'} / ${m.state === 'AT_CUSTOMER' ? 'with a customer' : 'in stock'}`;
+  const isBackdatedPreSoftware = (m) => m.at && asOf < m.at; // entered before the migration snapshot time
+
   for (const s of givenSerials) {
-    const stock = stockByRot[s];
-    if (stock === undefined) continue; // existence enforced above — defensive
+    if (stockByRot[s] === undefined) continue; // existence enforced above — defensive
     const isSwapRoundTrip = transaction_type === 'SWAP' && receivedSet.has(s);
-    if (stock !== 'IN_STOCK' && !isSwapRoundTrip) {
-      throw new HttpError(400, `Cylinder "${s}" is not available to give out (it is with a customer). Only in-stock cylinders can be given.`);
-    }
-    if (cylByRot[s].under_maintenance) {
+    if (isSwapRoundTrip) continue; // arrives within this same bill
+    if (cylByRot[s].under_maintenance) { // maintenance is a live flag, not historical
       throw new HttpError(400, `Cylinder "${s}" is under maintenance and cannot be given out until it is returned to stock.`);
     }
-    // Location-scoped availability: an in-stock cylinder can only be given from the site it is at.
-    // (Swap round-trips are exempt — the cylinder arrives at this site within the same bill.)
-    if (stock === 'IN_STOCK' && !isSwapRoundTrip && cylByRot[s].location !== location) {
-      throw new HttpError(400, `Cylinder "${s}" is in stock at ${LOCATION_LABELS[cylByRot[s].location] || cylByRot[s].location} — it cannot be given from ${LOCATION_LABELS[location]}. Transfer it to ${LOCATION_LABELS[location]} first.`);
+    const { state, holder, priorRealBills } = await stateAsOf(userId, s, asOf, null);
+    if (priorRealBills > 0) {
+      if (state.stock_state === 'AT_CUSTOMER') {
+        let by = '';
+        if (holder && holder.customer_id) { const hc = await Customer.findById(holder.customer_id).lean(); if (hc) by = ` by ${hc.company_name}`; }
+        throw new HttpError(400, `Cylinder "${s}" was already with a customer${by} as of ${fmtDT(asOf)}${holder ? ` (bill ${holder.bill_number})` : ''} — it can't be given out then.`);
+      }
+      if (state.location !== location) {
+        throw new HttpError(400, `Cylinder "${s}" was in stock at ${LOCATION_LABELS[state.location] || state.location} as of ${fmtDT(asOf)}, not ${LOCATION_LABELS[location]} — transfer it there first.`);
+      }
+      // in stock at this location as of that date → OK
+    } else {
+      const m = await migSnapshot(s);
+      const consistent = m.state === 'IN_STOCK' && m.loc === location;
+      if (!consistent) {
+        if (isBackdatedPreSoftware(m)) {
+          if (!confirmPre) preSoftware.push({ serial: s, direction: 'given', snapshot: snapText(m) });
+        } else if (m.state !== 'IN_STOCK') {
+          throw new HttpError(400, `Cylinder "${s}" is not available to give out (it is with a customer). Only in-stock cylinders can be given.`);
+        } else {
+          throw new HttpError(400, `Cylinder "${s}" is in stock at ${LOCATION_LABELS[m.loc] || m.loc} — it cannot be given from ${LOCATION_LABELS[location]}. Transfer it to ${LOCATION_LABELS[location]} first.`);
+        }
+      }
     }
   }
-  const givenSet = new Set(givenSerials);
+
   for (const s of receivedSerials) {
-    const stock = stockByRot[s];
-    if (stock === undefined) continue; // existence enforced above — defensive
-    // SWAP round-trip the outbound way (Phase 14, filling-vendor flow): a cylinder GIVEN on
-    // this same bill (sent for filling) may be RECEIVED back on the same bill too.
+    if (stockByRot[s] === undefined) continue; // existence enforced above — defensive
+    // SWAP round-trip the outbound way (Phase 14, filling-vendor): a cylinder GIVEN on this same
+    // bill (sent for filling) may be RECEIVED back on the same bill too.
     const isOutboundRoundTrip = transaction_type === 'SWAP' && givenSet.has(s);
-    if (stock !== 'AT_CUSTOMER' && !isOutboundRoundTrip) {
-      throw new HttpError(400, `Cylinder "${s}" is already in stock and cannot be received.`);
+    if (isOutboundRoundTrip) continue;
+    const { state, priorRealBills } = await stateAsOf(userId, s, asOf, null);
+    if (state.stock_state === 'AT_CUSTOMER') continue; // was out with a customer as of that date → OK
+    if (priorRealBills > 0) {
+      throw new HttpError(400, `Cylinder "${s}" was already in stock as of ${fmtDT(asOf)} (per its bill history) — it wasn't out with a customer then, so it can't be received.`);
+    } else {
+      const m = await migSnapshot(s);
+      const consistent = m.state === 'AT_CUSTOMER'; // receiving implies it was out beforehand
+      if (!consistent) {
+        if (isBackdatedPreSoftware(m)) {
+          if (!confirmPre) preSoftware.push({ serial: s, direction: 'received', snapshot: snapText(m) });
+        } else {
+          throw new HttpError(400, `Cylinder "${s}" is already in stock and cannot be received.`);
+        }
+      }
     }
+  }
+
+  // Pre-software confirmation (item 4): no genuine bill precedes these entries — only the migration
+  // placeholder, which they contradict. Return WITHOUT saving so the client can confirm; a genuine
+  // prior bill would have hard-rejected above instead, so this can never mask real contradictions.
+  if (preSoftware.length && !confirmPre) {
+    return {
+      requires_pre_software_confirmation: true,
+      as_of: asOf,
+      cylinders: preSoftware,
+      message: `No software history exists for these cylinder(s) before ${fmtDT(asOf)} — only the initial migration record, which shows a different state. Confirm this reflects genuine pre-software history to save it anyway.`
+    };
   }
 
   let finalCustomerId = customer_id;
@@ -898,6 +982,57 @@ async function createBill(userId, body, stepUp = null) {
   } catch (e) { /* non-fatal */ }
   try { await recomputeLocationPcStock(userId); } catch (e) { /* non-fatal */ }
 
+  // ─── Phase 33: per-cylinder history (log-only; the post-save hook owns the state change) ───
+  // GIVEN → "Given filled to [Customer]"; RECEIVED → "Received empty from [Customer]". Pre-save
+  // location/stock_state come from cylByRot (loaded before the save above).
+  try {
+    const cylHistory = require('./cylinderHistory.service');
+    const mgrMap = await cylHistory.getManagerMap(userId);
+    const performer = mgrMap[location] || '';
+    const locLabel = LOCATION_LABELS[location] || location;
+    let custName = '';
+    if (finalCustomerId) {
+      const custDoc = await Customer.findById(finalCustomerId).select('company_name').lean();
+      custName = (custDoc && custDoc.company_name) || '';
+    }
+    if (!custName && customer_type === 'ONE_TIME') {
+      custName = (one_time_customer && one_time_customer.company_name) || 'One-time customer';
+    }
+    const now = new Date();
+    const events = [];
+    for (const s of receivedSerials) {
+      const pre = cylByRot[s];
+      if (!pre) continue;
+      events.push({
+        user_id: userId, cylinder_id: pre._id, rotational_number: s,
+        event_type: 'RECEIVED',
+        description: `Received empty from ${custName || 'customer'} at ${locLabel}`,
+        from_location: pre.location, to_location: location,
+        from_state: pre.stock_state, to_state: 'IN_STOCK',
+        customer_name: custName, document_ref: bill.bill_number,
+        performed_by: performer, performed_at_location: location, event_at: bill.bill_date
+      });
+    }
+    for (const s of givenSerials) {
+      const pre = cylByRot[s];
+      if (!pre) continue;
+      events.push({
+        user_id: userId, cylinder_id: pre._id, rotational_number: s,
+        event_type: 'GIVEN',
+        description: `Given filled to ${custName || 'customer'} at ${locLabel}`,
+        from_location: pre.location, to_location: location,
+        from_state: pre.stock_state, to_state: 'AT_CUSTOMER',
+        customer_name: custName, document_ref: bill.bill_number,
+        performed_by: performer, performed_at_location: location, event_at: bill.bill_date
+      });
+    }
+    await cylHistory.logEvents(events);
+  } catch (e) { /* non-fatal */ }
+
+  // Phase 34: recompute live state from full history for every serial this bill touched, so an
+  // out-of-order (backdated) save never leaves a cylinder reflecting this bill instead of a newer one.
+  try { await recomputeCylinderState(userId, [...givenSerials, ...receivedSerials]); } catch (e) { /* non-fatal */ }
+
   return {
     bill_id: bill._id,
     bill_number: billNumber,
@@ -916,6 +1051,9 @@ async function createBill(userId, body, stepUp = null) {
 async function updateInternalTransfer(user, bill, body, stepUp = null) {
   const uid = user.id;
   const { bill_number, bill_date, challan_no, serial_numbers, personal_items, logEdit } = body;
+  // Snapshot the serials on the transfer BEFORE any edit, so Phase 34 recompute also refreshes
+  // any cylinder dropped from the transfer (bill.line_items is reassigned below).
+  const oldTransferSerials = [...new Set(bill.line_items.map(l => l.serial_number).filter(Boolean))];
 
   // bill_number-only edit (nothing else supplied) — allowed even after the 3-day lock.
   const keepLines = serial_numbers === undefined && personal_items === undefined &&
@@ -1045,8 +1183,15 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
     }
   }
 
+  const affectedT = [...new Set([
+    ...bill.line_items.map(l => l.serial_number).filter(Boolean),
+    ...(oldTransferSerials || [])
+  ])];
   await bill.save(); // post-save hook re-applies the (new) cylinder movements
   try { await recomputeLocationPcStock(uid); } catch (e) { /* non-fatal */ }
+  // Phase 34: recompute both the new AND removed serials — a serial dropped from this transfer
+  // must fall back to whatever its remaining bills say, not to this transfer's stale move.
+  try { await recomputeCylinderState(uid, affectedT); } catch (e) { /* non-fatal */ }
 
   return { bill_id: bill._id, changes, audited: !!(logEdit && changes.length), message: 'Transfer updated successfully' };
 }
@@ -1231,6 +1376,16 @@ async function updateBill(user, billId, body, stepUp = null) {
   }
   try { await recomputeLocationPcStock(uid); } catch (e) { /* non-fatal */ }
 
+  // Phase 34: authoritative state from full history for every serial the edit added OR removed —
+  // editing an old bill must never overwrite a newer bill's effect on a cylinder (the 1870 bug).
+  if (!keepLines) {
+    const affected = [...new Set([
+      ...newLines.map(l => l.serial_number).filter(Boolean),
+      ...oldSnap.lines.map(l => l.serial).filter(Boolean)
+    ])];
+    try { await recomputeCylinderState(uid, affected); } catch (e) { /* non-fatal */ }
+  }
+
   return {
     bill_id: bill._id,
     amount_changed: amountChanged,
@@ -1344,6 +1499,9 @@ async function deleteBill(uid, billId, stepUp = null) {
     } catch (e) { /* non-fatal */ }
   }
   try { await recomputeLocationPcStock(uid); } catch (e) { /* non-fatal */ }
+  // Phase 34: with the bill gone, each touched serial's authoritative state = replay of its
+  // REMAINING bills (supersedes the best-effort per-serial revert above).
+  try { await recomputeCylinderState(uid, serials); } catch (e) { /* non-fatal */ }
 
   return { message: `Bill ${bill.bill_number} deleted`, bill_number: bill.bill_number };
 }
