@@ -1054,6 +1054,14 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
   // Snapshot the serials on the transfer BEFORE any edit, so Phase 34 recompute also refreshes
   // any cylinder dropped from the transfer (bill.line_items is reassigned below).
   const oldTransferSerials = [...new Set(bill.line_items.map(l => l.serial_number).filter(Boolean))];
+  // Preserve each existing line's added_at (Phase 35) across the rebuild so a cylinder added in a
+  // prior edit keeps its effective time; only cylinders NEW to this edit get stamped with "now".
+  const oldAddedAt = {}; bill.line_items.forEach(l => { if (l.serial_number) oldAddedAt[l.serial_number] = l.added_at || null; });
+  const editNow = new Date();
+  // Phase 35: context for logging a history event on each cylinder ADDED during this edit (populated
+  // below when lines actually change). Without this, an added cylinder's state was recomputed but its
+  // transfer never appeared in its per-cylinder history.
+  let addedCtx = null;
 
   // bill_number-only edit (nothing else supplied) — allowed even after the 3-day lock.
   const keepLines = serial_numbers === undefined && personal_items === undefined &&
@@ -1130,7 +1138,10 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
       return {
         direction: 'TRANSFER', gas_type_id: gasId, cylinder_size_id: sizeId,
         gas_type_name: cyl.gas_type, size_label: cyl.capacity,
-        serial_number: s, quantity: 1, rate: 0, amount: 0
+        serial_number: s, quantity: 1, rate: 0, amount: 0,
+        // Phase 35: a cylinder new to this edit is stamped "now" so the transfer is ordered as its
+        // latest action; existing cylinders keep whatever added_at they already had.
+        added_at: Object.prototype.hasOwnProperty.call(oldAddedAt, s) ? oldAddedAt[s] : editNow
       };
     });
     for (const p of personalItems) {
@@ -1152,7 +1163,15 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
     if (to_location !== bill.to_location) changes.push(`To changed to ${LOCATION_LABELS[to_location]}`);
     const newSet = new Set(serials);
     oldSerials.forEach(s => { if (!newSet.has(s)) changes.push(`Cylinder ${s} removed`); });
-    serials.forEach(s => { if (!oldSerials.includes(s)) changes.push(`Cylinder ${s} added`); });
+    const addedSerials = serials.filter(s => !oldSerials.includes(s));
+    addedSerials.forEach(s => changes.push(`Cylinder ${s} added`));
+    if (addedSerials.length) {
+      addedCtx = {
+        serials: addedSerials, byRot, from_location, to_location,
+        fromLabel: LOCATION_LABELS[from_location] || from_location,
+        toLabel: LOCATION_LABELS[to_location] || to_location
+      };
+    }
     const oldPc = bill.line_items.reduce((t, l) => t + (Number(l.personalCylindersIn) || 0), 0);
     const newPc = personalItems.reduce((t, p) => t + p.quantity, 0);
     if (oldPc !== newPc) changes.push(`Personal cylinders changed from ${oldPc} to ${newPc}`);
@@ -1192,6 +1211,26 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
   // Phase 34: recompute both the new AND removed serials — a serial dropped from this transfer
   // must fall back to whatever its remaining bills say, not to this transfer's stale move.
   try { await recomputeCylinderState(uid, affectedT); } catch (e) { /* non-fatal */ }
+
+  // Phase 35: log a per-cylinder history event for every cylinder ADDED during this edit, marked as
+  // added-in-update. event_at = editNow matches the line's added_at effective time, so the entry
+  // sorts to the top of the cylinder's history and agrees with the state replay.
+  if (addedCtx && addedCtx.serials.length) {
+    try {
+      const cylHistory = require('./cylinderHistory.service');
+      const mgrMap = await cylHistory.getManagerMap(uid);
+      const performer = mgrMap[addedCtx.from_location] || '';
+      await cylHistory.logEvents(addedCtx.serials.map(s => ({
+        user_id: uid, cylinder_id: addedCtx.byRot[s]._id, rotational_number: s,
+        event_type: 'TRANSFER',
+        description: `Transferred from ${addedCtx.fromLabel} to ${addedCtx.toLabel} (added later in an update)`,
+        from_location: addedCtx.from_location, to_location: addedCtx.to_location,
+        from_state: 'IN_STOCK', to_state: 'IN_STOCK',
+        document_ref: bill.bill_number,
+        performed_by: performer, performed_at_location: addedCtx.from_location, event_at: editNow
+      })));
+    } catch (e) { /* non-fatal */ }
+  }
 
   return { bill_id: bill._id, changes, audited: !!(logEdit && changes.length), message: 'Transfer updated successfully' };
 }
@@ -1257,7 +1296,6 @@ async function updateBill(user, billId, body, stepUp = null) {
     amount: bill.total_bill_amount || 0,
     lines: bill.line_items.map(l => ({ key: l.direction + '|' + l.serial_number, serial: l.serial_number, direction: l.direction, rate: l.rate || 0 }))
   };
-
   const newLines = keepLines ? bill.line_items : line_items.map(l => {
     const rate = l.direction === 'GIVEN' ? (Number(l.rate) || 0) : 0;
     const serial = String(l.serial_number || '').trim();

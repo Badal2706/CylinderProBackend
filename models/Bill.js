@@ -43,6 +43,13 @@ const billLineItemSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // ─── Phase 35: effective time for state ordering ───
+  // When a cylinder is ADDED to a bill during a LATER edit, its physical movement happened at the
+  // edit moment, not at the bill's original date. This stamps that moment so the state replay orders
+  // the added line by when it was actually added (not the bill's creation time), keeping a later
+  // transfer authoritative over receives that were entered before the edit. Absent on original lines
+  // (they fall back to bill_date), so historical data and same-session creation are unchanged.
+  added_at: { type: Date, default: null },
   // ─── Personal cylinders (quantity-only; customer's own cylinders, NOT our inventory) ───
   // Recorded per gas-type line. They never touch Cylinder inventory status.
   personalCylindersIn:  { type: Number, default: 0 }, // received from customer (→ we hold more)
