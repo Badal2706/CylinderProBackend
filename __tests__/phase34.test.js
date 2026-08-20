@@ -99,6 +99,30 @@ describe('Phase 34', () => {
     expect((await locOf('E')).stock_state).toBe('AT_CUSTOMER');
   });
 
+  test('editing an OLD bill to ADD a cylinder recomputes that cylinder; the LATEST bill wins', async () => {
+    await mk('G2'); await mk('H2');
+    const oldBill = await given('H2', day('02'), CH);   // an old bill (day 2)
+    await given('G2', day('10'), CH);                    // G2's latest real event = given (day 10)
+    expect((await locOf('G2')).stock_state).toBe('AT_CUSTOMER');
+    // Edit the OLD (day-2) bill to ALSO record G2 as received back that day — G2 is NEWLY added to it.
+    await billSvc.updateBill({ id: String(uid), name: 'P34' }, String(oldBill.bill_id), {
+      challan_no: 'e', logEdit: false,
+      line_items: [
+        { direction: 'GIVEN', gas_type_id: String(gas._id), cylinder_size_id: String(size._id), serial_number: 'H2', rate: 100 },
+        { direction: 'RECEIVED', gas_type_id: String(gas._id), cylinder_size_id: String(size._id), serial_number: 'G2' }
+      ]
+    });
+    // G2 (newly added to the edited old bill) is recomputed, and its day-10 give — the chronologically
+    // latest event — remains authoritative, so the old bill's day-2 receive does not override it.
+    expect((await locOf('G2')).stock_state).toBe('AT_CUSTOMER');
+    // And removing G2 from the old bill again re-recomputes it (still AT_CUSTOMER from the day-10 give).
+    await billSvc.updateBill({ id: String(uid), name: 'P34' }, String(oldBill.bill_id), {
+      challan_no: 'e', logEdit: false,
+      line_items: [{ direction: 'GIVEN', gas_type_id: String(gas._id), cylinder_size_id: String(size._id), serial_number: 'H2', rate: 100 }]
+    });
+    expect((await locOf('G2')).stock_state).toBe('AT_CUSTOMER');
+  });
+
   test('same-day normal entry behaves as before — no confirmation prompt', async () => {
     await mk('F');
     const g = await given('F', new Date(), CH); // today, from its real location
