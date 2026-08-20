@@ -25,7 +25,7 @@ const DRY = process.env.DRY === '1';
   const bills = await Bill.find({ transaction_category: 'INTERNAL_TRANSFER', 'edit_history.0': { $exists: true } }).lean();
   const affectedByUser = {};
   const mgrMaps = {};
-  let billsTouched = 0, stamped = 0, historyLogged = 0;
+  let billsTouched = 0, stamped = 0, historyLogged = 0, relabelled = 0;
   const samples = [];
 
   for (const b of bills) {
@@ -72,7 +72,17 @@ const DRY = process.env.DRY === '1';
       const exists = await CylinderHistory.findOne({
         user_id: b.user_id, cylinder_id: cid, event_type: 'TRANSFER', document_ref: b.bill_number
       }).lean();
-      if (exists) continue;
+      if (exists) {
+        // The event is already there but predates the label — mark it as added-in-update so the
+        // history reads the same whether the entry was backfilled or logged at edit time.
+        if (!/added later in an update/.test(exists.description || '')) {
+          const desc = `${exists.description || `Transferred from ${fromLabel} to ${toLabel}`} (added later in an update)`;
+          if (samples.length < 16) samples.push(`  label: ${b.bill_number} cyl ${s}`);
+          if (!DRY) await CylinderHistory.updateOne({ _id: exists._id }, { $set: { description: desc } });
+          relabelled++;
+        }
+        continue;
+      }
       missing.push({
         user_id: b.user_id, cylinder_id: cid, rotational_number: s,
         event_type: 'TRANSFER',
@@ -90,7 +100,7 @@ const DRY = process.env.DRY === '1';
     }
   }
 
-  console.log(`${DRY ? '[DRY] ' : ''}transfer bills touched=${billsTouched}  added_at stamped=${stamped}  history events logged=${historyLogged}`);
+  console.log(`${DRY ? '[DRY] ' : ''}transfer bills touched=${billsTouched}  added_at stamped=${stamped}  history events logged=${historyLogged}  relabelled=${relabelled}`);
   samples.forEach(s => console.log('  ' + s));
   if (!DRY) {
     let corrected = 0;
