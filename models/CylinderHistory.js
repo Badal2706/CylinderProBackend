@@ -14,7 +14,9 @@ const cylinderHistorySchema = new mongoose.Schema({
   rotational_number: { type: String, default: '' },
   event_type: {
     type: String,
-    enum: ['MIGRATED', 'RECEIVED', 'GIVEN', 'TRANSFER', 'FILLED', 'MANUAL_EDIT'],
+    // BILL_DELETED / REMOVED_FROM_BILL record that an entry was undone — without them a cylinder
+    // silently reverted with nothing in its log to explain why.
+    enum: ['MIGRATED', 'RECEIVED', 'GIVEN', 'TRANSFER', 'FILLED', 'MANUAL_EDIT', 'BILL_DELETED', 'REMOVED_FROM_BILL'],
     required: true
   },
   description: { type: String, default: '' },

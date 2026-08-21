@@ -1,5 +1,14 @@
 const Bill = require('../models/Bill');
 const Cylinder = require('../models/Cylinder');
+const Customer = require('../models/Customer');
+
+// Filling-vendor customer ids for a user, as a Set of strings. Both the live recompute and the
+// as-of validation pass this into replaySerial so a same-bill round trip resolves identically
+// everywhere (see replaySerial).
+async function fillingVendorIds(userId) {
+  const vendors = await Customer.find({ user_id: userId, is_filling_vendor: true }, { _id: 1 }).lean();
+  return new Set(vendors.map(v => String(v._id)));
+}
 
 // ─── Cylinder state derived from bill history (single source of truth) ───
 // A cylinder's live location/stock_state must ALWAYS equal the result of replaying its full real
@@ -17,12 +26,20 @@ function lineEffTime(bill, line) {
 
 // Replay ONE serial's events to a final { state, holder } (holder = current customer when
 // AT_CUSTOMER). `cutoff` (optional Date) includes only events effective on/before it — used for the
-// date-aware "as of" validation. Faithful to the post-save hook:
+// date-aware "as of" validation. `vendorIds` = Set of filling-vendor customer ids (as strings).
 //   TRANSFER → location = to_location (stock_state unchanged)
 //   RECEIVED → IN_STOCK at bill.location
-//   GIVEN    → AT_CUSTOMER at bill.location, EXCEPT a same-bill outbound round-trip (was IN_STOCK,
-//              sent for filling + received back on the same bill) which stays IN_STOCK.
-function replaySerial(bills, rot, initial, cutoff) {
+//   GIVEN    → AT_CUSTOMER at bill.location
+//   GIVEN+RECEIVED on the SAME bill (a round trip) → decided by who the other party is:
+//     · filling vendor  — we sent it empty and got it back filled → it ends in OUR stock
+//     · normal customer — they returned one and took one → it ends WITH THEM
+// That party test replaced an older guess based on the cylinder's previous stock_state, which was
+// unreliable: transfers never set stock_state, so a cylinder whose prior history was only transfers
+// looked "not in stock" and a vendor round-trip was misread as still being with the customer. Live
+// inventory happened to seed from the real state and got it right, while the as-of validation seeded
+// from an empty state and got it wrong — so the same cylinder passed in inventory but was rejected
+// at entry time. Deciding by the party makes both paths agree by construction.
+function replaySerial(bills, rot, initial, cutoff, vendorIds) {
   const evs = [];
   for (const b of bills) {
     const lines = (b.line_items || []).filter(li => (li.serial_number || '').trim() === rot);
@@ -48,9 +65,12 @@ function replaySerial(bills, rot, initial, cutoff) {
   for (const e of evs) {
     if (e.isTransfer) { st.location = e.to; continue; } // stock_state unchanged by a transfer
     if (e.hasR && e.hasG) {
-      const preInStock = st.stock_state === 'IN_STOCK'; // outbound round-trip stays IN_STOCK
-      st.location = e.loc; st.stock_state = preInStock ? 'IN_STOCK' : 'AT_CUSTOMER';
-      holder = preInStock ? null : { customer_id: e.bill.customer_id, bill_number: e.bill.bill_number };
+      const cid = e.bill.customer_id ? String(e.bill.customer_id._id || e.bill.customer_id) : '';
+      // Known vendor → ours. Known customer → theirs. Without the vendor list (legacy callers),
+      // fall back to the old previous-state guess rather than changing behaviour blindly.
+      const ours = vendorIds ? vendorIds.has(cid) : st.stock_state === 'IN_STOCK';
+      st.location = e.loc; st.stock_state = ours ? 'IN_STOCK' : 'AT_CUSTOMER';
+      holder = ours ? null : { customer_id: e.bill.customer_id, bill_number: e.bill.bill_number };
     } else if (e.hasR) {
       st.location = e.loc; st.stock_state = 'IN_STOCK'; holder = null;
     } else if (e.hasG) {
@@ -74,6 +94,7 @@ async function recomputeCylinderState(userId, serials) {
     user_id: userId, is_draft: { $ne: true },
     'line_items.serial_number': { $in: rots }
   }).lean();
+  const vendorIds = await fillingVendorIds(userId);
   // Bills per serial (a bill can touch several of the requested serials).
   const bySerial = {};
   rots.forEach(r => { bySerial[r] = []; });
@@ -87,7 +108,7 @@ async function recomputeCylinderState(userId, serials) {
 
   const changes = [];
   for (const c of cyls) {
-    const { state: t } = replaySerial(bySerial[c.rotational_number] || [], c.rotational_number, { location: c.location, stock_state: c.stock_state });
+    const { state: t } = replaySerial(bySerial[c.rotational_number] || [], c.rotational_number, { location: c.location, stock_state: c.stock_state }, null, vendorIds);
     if (c.location !== t.location || c.stock_state !== t.stock_state) {
       await Cylinder.updateOne({ _id: c._id }, { location: t.location, stock_state: t.stock_state });
       changes.push({ rotational_number: c.rotational_number, from: `${c.location}/${c.stock_state}`, to: `${t.location}/${t.stock_state}` });
@@ -104,8 +125,9 @@ async function stateAsOf(userId, serial, asOf, excludeBillId) {
   const q = { user_id: userId, is_draft: { $ne: true }, 'line_items.serial_number': rot };
   if (excludeBillId) q._id = { $ne: excludeBillId };
   const bills = await Bill.find(q).lean();
-  const { state, holder, count } = replaySerial(bills, rot, { location: '', stock_state: '' }, new Date(asOf));
+  const vendorIds = await fillingVendorIds(userId);
+  const { state, holder, count } = replaySerial(bills, rot, { location: '', stock_state: '' }, new Date(asOf), vendorIds);
   return { state, holder, priorRealBills: count };
 }
 
-module.exports = { lineEffTime, replaySerial, recomputeCylinderState, stateAsOf, CH };
+module.exports = { lineEffTime, replaySerial, recomputeCylinderState, stateAsOf, fillingVendorIds, CH };

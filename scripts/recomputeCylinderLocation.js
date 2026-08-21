@@ -8,7 +8,7 @@ const mongoose = require('mongoose');
 const connectDB = require('../config/mongodb');
 const Bill = require('../models/Bill');
 const Cylinder = require('../models/Cylinder');
-const { replaySerial } = require('../services/cylinderState.service');
+const { replaySerial, fillingVendorIds } = require('../services/cylinderState.service');
 const { LOCATION_LABELS } = require('../config/locations');
 
 const DRY = process.env.DRY === '1';
@@ -17,7 +17,7 @@ const DRY = process.env.DRY === '1';
   await connectDB();
 
   const cyls = await Cylinder.find({}, { rotational_number: 1, user_id: 1, location: 1, stock_state: 1 }).lean();
-  const bills = await Bill.find({ is_draft: { $ne: true } }, { user_id: 1, bill_number: 1, bill_date: 1, createdAt: 1, transaction_category: 1, location: 1, to_location: 1, line_items: 1 }).lean();
+  const bills = await Bill.find({ is_draft: { $ne: true } }, { user_id: 1, bill_number: 1, bill_date: 1, createdAt: 1, transaction_category: 1, location: 1, to_location: 1, line_items: 1, customer_id: 1 }).lean();
 
   // Index bills by `${user}|${serial}`.
   const key = (u, r) => `${u}|${r}`;
@@ -32,11 +32,15 @@ const DRY = process.env.DRY === '1';
     }
   }
 
+  // Same filling-vendor rule the live recompute uses, per user.
+  const vendorCache = {};
+  const vendorsFor = async (u) => (vendorCache[u] || (vendorCache[u] = await fillingVendorIds(u)));
+
   const mismatches = [];
   for (const c of cyls) {
     const sbills = bySerial[key(c.user_id, c.rotational_number)] || [];
     if (!sbills.length) continue; // never on a bill → leave as-is
-    const { state: t } = replaySerial(sbills, c.rotational_number, { location: c.location, stock_state: c.stock_state });
+    const { state: t } = replaySerial(sbills, c.rotational_number, { location: c.location, stock_state: c.stock_state }, null, await vendorsFor(String(c.user_id)));
     if (c.location !== t.location || c.stock_state !== t.stock_state) {
       mismatches.push({ id: c._id, rot: c.rotational_number,
         from: `${LOCATION_LABELS[c.location] || c.location} / ${c.stock_state}`,

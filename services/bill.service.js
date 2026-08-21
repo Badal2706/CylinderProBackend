@@ -176,12 +176,53 @@ async function generateBillNumber() {
 // frontend now always sends a real UTC instant, but a browser running cached older JS still could
 // not, so normalize here too. Date-only values ("2026-08-20") keep their existing meaning.
 const IST_OFFSET_MS = 330 * 60 * 1000;
+// All operator-facing dates/times are rendered in IST — the server runs UTC, so without an explicit
+// zone an error would quote a bill's own time 5:30 off ("as of 07:40" for a 1:10 PM bill).
+const IST_TZ = 'Asia/Kolkata';
+const fmtIstDate = (d) => new Date(d).toLocaleDateString('en-GB', { timeZone: IST_TZ });
+const fmtIstDateTime = (d) => new Date(d).toLocaleString('en-GB', {
+  timeZone: IST_TZ, day: '2-digit', month: '2-digit', year: 'numeric',
+  hour: 'numeric', minute: '2-digit', hour12: true
+});
 function normalizeBillDate(v) {
   if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(v)) {
     const asUtc = new Date(`${v}Z`);
     if (!isNaN(asUtc.getTime())) return new Date(asUtc.getTime() - IST_OFFSET_MS);
   }
   return v;
+}
+
+// Log that an entry was UNDONE for these serials — the bill was deleted, or the cylinder was taken
+// off it during an edit. Without this a cylinder silently reverted to its previous place with
+// nothing in its own history to explain why (and re-entering the same cylinder looked like a
+// duplicate). Purely a log: the state itself is already put right by the replay.
+// `mode` is 'BILL_DELETED' or 'REMOVED_FROM_BILL'. event_at = now, because undoing it IS the event.
+async function logRemovalEvents(userId, bill, serials, mode) {
+  const list = [...new Set((serials || []).map(s => String(s || '').trim()).filter(Boolean))];
+  if (!list.length) return;
+  const cylHistory = require('./cylinderHistory.service');
+  const Cylinder = require('../models/Cylinder');
+  const cyls = await Cylinder.find(
+    { user_id: userId, rotational_number: { $in: list } },
+    { _id: 1, rotational_number: 1, location: 1, stock_state: 1 }
+  ).lean();
+  if (!cyls.length) return;
+
+  const atSite = bill.transaction_category === 'INTERNAL_TRANSFER' ? bill.from_location : bill.location;
+  const mgrMap = await cylHistory.getManagerMap(userId);
+  const now = new Date();
+  await cylHistory.logEvents(cyls.map(c => ({
+    user_id: userId, cylinder_id: c._id, rotational_number: c.rotational_number,
+    event_type: mode,
+    description: mode === 'BILL_DELETED'
+      // The cylinder's place is recomputed from its remaining bills, so report where it ended up.
+      ? `Entry ${bill.bill_number} was deleted — cylinder reverted to ${LOCATION_LABELS[c.location] || c.location} (${c.stock_state === 'AT_CUSTOMER' ? 'with customer' : 'in stock'})`
+      : `Removed from entry ${bill.bill_number} — cylinder reverted to ${LOCATION_LABELS[c.location] || c.location} (${c.stock_state === 'AT_CUSTOMER' ? 'with customer' : 'in stock'})`,
+    to_location: c.location, to_state: c.stock_state,
+    document_ref: bill.bill_number,
+    performed_by: mgrMap[atSite] || '', performed_at_location: atSite || '',
+    event_at: now
+  })));
 }
 
 // Find the current holder of a cylinder = the most recent GIVEN line for that rotational number
@@ -673,7 +714,7 @@ async function createBill(userId, body, stepUp = null) {
   // on/before it), not its live current state. For a same-day entry asOf ≈ now, so the replay equals
   // the live state and behaviour is unchanged. Backdated entries validate against real history.
   const asOf = bill_date ? new Date(bill_date) : new Date();
-  const fmtDT = (d) => new Date(d).toLocaleString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const fmtDT = (d) => fmtIstDateTime(d);
   const givenSet = new Set(givenSerials);
   const confirmPre = !!body.confirm_pre_software;
   const preSoftware = []; // cylinders whose ONLY contradiction is the Phase 33 migration placeholder
@@ -1003,17 +1044,20 @@ async function createBill(userId, body, stepUp = null) {
   try { await recomputeLocationPcStock(userId); } catch (e) { /* non-fatal */ }
 
   // ─── Phase 33: per-cylinder history (log-only; the post-save hook owns the state change) ───
-  // GIVEN → "Given filled to [Customer]"; RECEIVED → "Received empty from [Customer]". Pre-save
-  // location/stock_state come from cylByRot (loaded before the save above).
+  // Normal customer: GIVEN → "Given filled to [Customer]"; RECEIVED → "Received empty from".
+  // Filling vendor: the flow is inverted — we send cylinders EMPTY to be filled and get them back
+  // FILLED — so the wording is swapped, otherwise the log reads backwards for every vendor bill.
+  // Pre-save location/stock_state come from cylByRot (loaded before the save above).
   try {
     const cylHistory = require('./cylinderHistory.service');
     const mgrMap = await cylHistory.getManagerMap(userId);
     const performer = mgrMap[location] || '';
     const locLabel = LOCATION_LABELS[location] || location;
-    let custName = '';
+    let custName = '', isVendor = false;
     if (finalCustomerId) {
-      const custDoc = await Customer.findById(finalCustomerId).select('company_name').lean();
+      const custDoc = await Customer.findById(finalCustomerId).select('company_name is_filling_vendor').lean();
       custName = (custDoc && custDoc.company_name) || '';
+      isVendor = !!(custDoc && custDoc.is_filling_vendor);
     }
     if (!custName && customer_type === 'ONE_TIME') {
       custName = (one_time_customer && one_time_customer.company_name) || 'One-time customer';
@@ -1026,7 +1070,9 @@ async function createBill(userId, body, stepUp = null) {
       events.push({
         user_id: userId, cylinder_id: pre._id, rotational_number: s,
         event_type: 'RECEIVED',
-        description: `Received empty from ${custName || 'customer'} at ${locLabel}`,
+        description: isVendor
+          ? `Received filled from ${custName || 'vendor'} at ${locLabel}`
+          : `Received empty from ${custName || 'customer'} at ${locLabel}`,
         from_location: pre.location, to_location: location,
         from_state: pre.stock_state, to_state: 'IN_STOCK',
         customer_name: custName, document_ref: bill.bill_number,
@@ -1039,7 +1085,9 @@ async function createBill(userId, body, stepUp = null) {
       events.push({
         user_id: userId, cylinder_id: pre._id, rotational_number: s,
         event_type: 'GIVEN',
-        description: `Given filled to ${custName || 'customer'} at ${locLabel}`,
+        description: isVendor
+          ? `Given empty to ${custName || 'vendor'} for filling at ${locLabel}`
+          : `Given filled to ${custName || 'customer'} at ${locLabel}`,
         from_location: pre.location, to_location: location,
         from_state: pre.stock_state, to_state: 'AT_CUSTOMER',
         customer_name: custName, document_ref: bill.bill_number,
@@ -1177,7 +1225,7 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
     }
 
     // Human-readable diff for the audit trail.
-    const d2 = (d) => new Date(d).toLocaleDateString('en-GB');
+    const d2 = (d) => fmtIstDate(d);
     if (bill_date && d2(bill_date) !== d2(bill.bill_date)) changes.push(`Bill Date changed from ${d2(bill.bill_date)} to ${d2(bill_date)}`);
     if (challan_no !== undefined && newChallan !== bill.challan_no) changes.push(`Challan No. changed from ${bill.challan_no || '(none)'} to ${newChallan}`);
     if (from_location !== bill.from_location) changes.push(`From changed to ${LOCATION_LABELS[from_location]}`);
@@ -1232,6 +1280,15 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
   // Phase 34: recompute both the new AND removed serials — a serial dropped from this transfer
   // must fall back to whatever its remaining bills say, not to this transfer's stale move.
   try { await recomputeCylinderState(uid, affectedT); } catch (e) { /* non-fatal */ }
+
+  // Keep this transfer's history rows on its current date, and log any cylinder dropped from it.
+  try {
+    const cylHistory = require('./cylinderHistory.service');
+    await cylHistory.syncBillTimes(uid, bill);
+    const stillOn = new Set(bill.line_items.map(l => l.serial_number).filter(Boolean));
+    const dropped = (oldTransferSerials || []).filter(s => !stillOn.has(s));
+    if (dropped.length) await logRemovalEvents(uid, bill, dropped, 'REMOVED_FROM_BILL');
+  } catch (e) { /* non-fatal */ }
 
   // Phase 35: log a per-cylinder history event for every cylinder ADDED during this edit, marked as
   // added-in-update. event_at = editNow matches the line's added_at effective time, so the entry
@@ -1311,7 +1368,7 @@ async function updateBill(user, billId, body, stepUp = null) {
   const gasName = {}; gasDocs.forEach(g => { gasName[String(g._id)] = g.gas_type_name; });
   const sizeName = {}; sizeDocs.forEach(s => { sizeName[String(s._id)] = s.size_label; });
 
-  const d2 = (d) => new Date(d).toLocaleDateString('en-GB');
+  const d2 = (d) => fmtIstDate(d);
   const oldSnap = {
     bill_number: bill.bill_number,
     bill_date: bill.bill_date, challan_no: bill.challan_no || '', transaction_type: bill.transaction_type,
@@ -1342,6 +1399,43 @@ async function updateBill(user, billId, body, stepUp = null) {
   if (!keepLines) {
     const pcCustomer = await Customer.findOne({ _id: bill.customer_id, user_id: uid });
     await assertPersonalPerCombo(uid, bill.customer_id, newLines, bill._id, !!(pcCustomer && pcCustomer.is_filling_vendor));
+  }
+
+  // ─── Moving a bill's date re-times every cylinder on it ───
+  // Creating a bill validates each cylinder against its state AS OF the bill date; editing the date
+  // never did, so a bill could be moved to a moment when its cylinders were somewhere else and the
+  // replay would quietly produce a wrong location. Re-run the same as-of check (excluding this bill)
+  // and hand the operator the specific conflicts instead of a bare failure — they can still force it
+  // through with confirm_date_change when the paperwork really is out of order.
+  if (!keepLines && bill_date && new Date(bill_date).getTime() !== new Date(oldSnap.bill_date).getTime()) {
+    const asOfNew = new Date(bill_date);
+    const conflicts = [];
+    for (const l of newLines) {
+      const s = (l.serial_number || '').trim();
+      if (!s) continue;
+      const { state, holder, priorRealBills } = await stateAsOf(uid, s, asOfNew, bill._id);
+      if (!priorRealBills) continue; // nothing before it to contradict
+      if (l.direction === 'GIVEN' && state.stock_state === 'AT_CUSTOMER') {
+        let by = '';
+        if (holder && holder.customer_id) {
+          const hc = await Customer.findById(holder.customer_id).lean();
+          if (hc) by = ` with ${hc.company_name}`;
+        }
+        conflicts.push({ serial: s, problem: `was already out${by} on ${fmtIstDateTime(asOfNew)}, so it could not be given out then.` });
+      } else if (l.direction === 'RECEIVED' && state.stock_state !== 'AT_CUSTOMER') {
+        conflicts.push({ serial: s, problem: `was already in stock at ${LOCATION_LABELS[state.location] || state.location} on ${fmtIstDateTime(asOfNew)}, so there was nothing to receive back.` });
+      }
+    }
+    if (conflicts.length && !body.confirm_date_change) {
+      return {
+        requires_date_change_confirmation: true,
+        bill_id: bill._id,
+        from: fmtIstDateTime(oldSnap.bill_date),
+        to: fmtIstDateTime(asOfNew),
+        conflicts,
+        message: `Moving this bill to ${fmtIstDateTime(asOfNew)} contradicts ${conflicts.length} cylinder${conflicts.length === 1 ? "'s" : "s'"} history. Fix the other entries first, or force the change if the paperwork really was out of order.`
+      };
+    }
   }
 
   // ── Compute diff ──
@@ -1444,6 +1538,15 @@ async function updateBill(user, billId, body, stepUp = null) {
       ...oldSnap.lines.map(l => l.serial).filter(Boolean)
     ])];
     try { await recomputeCylinderState(uid, affected); } catch (e) { /* non-fatal */ }
+    // Keep this bill's history rows on its current date, and log any cylinder taken off it.
+    try {
+      const cylHistory = require('./cylinderHistory.service');
+      await cylHistory.syncBillTimes(uid, bill);
+      const stillOn = new Set(newLines.map(l => l.serial_number).filter(Boolean));
+      const removed = [...new Set(oldSnap.lines.map(l => l.serial).filter(Boolean))]
+        .filter(sn => !stillOn.has(sn));
+      if (removed.length) await logRemovalEvents(uid, bill, removed, 'REMOVED_FROM_BILL');
+    } catch (e) { /* non-fatal */ }
   }
 
   return {
@@ -1569,6 +1672,8 @@ async function deleteBill(uid, billId, stepUp = null) {
   // Phase 34: with the bill gone, each touched serial's authoritative state = replay of its
   // REMAINING bills (supersedes the best-effort per-serial revert above).
   try { await recomputeCylinderState(uid, [...serials, ...settlementTouched]); } catch (e) { /* non-fatal */ }
+  // Logged AFTER the recompute so each line reports where the cylinder actually ended up.
+  try { await logRemovalEvents(uid, bill, serials, 'BILL_DELETED'); } catch (e) { /* non-fatal */ }
 
   return { message: `Bill ${bill.bill_number} deleted`, bill_number: bill.bill_number };
 }

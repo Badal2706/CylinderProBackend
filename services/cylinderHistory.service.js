@@ -40,6 +40,26 @@ async function logEvents(entries) {
   }
 }
 
+// Re-point a bill's history rows at its CURRENT effective time. A bill's date is editable, and the
+// per-cylinder log is written once at save — so without this an edited bill kept its original time
+// in every cylinder's history, disagreeing with the transaction list and with the replay order that
+// decides where the cylinder actually is. Called after every bill edit. Touches only timestamps.
+async function syncBillTimes(userId, bill) {
+  const refs = [bill.bill_number, ...((bill.bill_number_history || []).map(h => h.old_value))].filter(Boolean);
+  if (!refs.length) return 0;
+  const rows = await CylinderHistory.find({ user_id: userId, document_ref: { $in: refs } }).lean();
+  let touched = 0;
+  for (const r of rows) {
+    const line = (bill.line_items || []).find(li => (li.serial_number || '').trim() === (r.rotational_number || '').trim());
+    // Same effective time the state replay uses: the line's added_at when set, else the bill date.
+    const eff = line && line.added_at ? new Date(line.added_at) : new Date(bill.bill_date);
+    if (Math.abs(new Date(r.event_at).getTime() - eff.getTime()) <= 1000) continue;
+    await CylinderHistory.updateOne({ _id: r._id }, { $set: { event_at: eff } });
+    touched++;
+  }
+  return touched;
+}
+
 // The 15 most recent entries for one cylinder (most recent first), plus a small cylinder header.
 async function getHistory(userId, cylinderId) {
   const cyl = await Cylinder.findOne({ _id: cylinderId, user_id: userId }).lean();
@@ -89,6 +109,9 @@ async function getHistory(userId, cylinderId) {
       from_state: r.from_state || '',
       to_state: r.to_state || '',
       customer_name: r.customer_name || '',
+      // When this log line was last touched — an edit to the bill's date re-points event_at and
+      // bumps this, so the popup can show "entered" vs "last changed".
+      changed_at: r.updatedAt || r.createdAt,
       // Current bill number (falls back to the logged snapshot if the bill is gone) + its challan.
       document_ref: (byRef[r.document_ref] && byRef[r.document_ref].bill_number) || r.document_ref || '',
       challan_no: (byRef[r.document_ref] && byRef[r.document_ref].challan_no) || ''
@@ -96,4 +119,4 @@ async function getHistory(userId, cylinderId) {
   };
 }
 
-module.exports = { getManagerMap, logEvents, getHistory, CAP };
+module.exports = { getManagerMap, logEvents, getHistory, syncBillTimes, CAP };
