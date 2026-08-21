@@ -18,7 +18,8 @@
 //
 // @param {Array} bills - ONE customer's bills (each with a line_items array). Never mix customers:
 //                        netting is per serial, so another customer's return would cancel this
-//                        customer's issue.
+//                        customer's issue. Callers using a projection MUST include
+//                        line_items.serial_number, or every line looks serial-less and held is 0.
 // @returns {{ totalGiven:number, totalReceived:number, held:number, totalBillAmount:number,
 //             heldSerials:string[], breakdown:Array<{gas_type_name,size_label,currently_held}> }}
 function computeHoldings(bills) {
@@ -28,7 +29,6 @@ function computeHoldings(bills) {
 
   const net = {};   // serial -> net quantity
   const meta = {};  // serial -> { gas_type_name, size_label } from its most recent GIVEN
-  let bulk = 0;     // serial-less lines (personal-only lines carry quantity 0, so normally a no-op)
 
   for (const bill of (bills || [])) {
     for (const item of (bill.line_items || [])) {
@@ -43,15 +43,13 @@ function computeHoldings(bills) {
         } else if (serial) {
           net[serial] = (net[serial] || 0) + qty;
           meta[serial] = { gas_type_name: item.gas_type_name || '', size_label: item.size_label || '' };
-        } else {
-          bulk += qty;
         }
+        // Serial-less lines are personal-cylinder-only lines, which carry quantity 0 — nothing to hold.
       } else if (item.direction === 'RECEIVED') {
         // A cross-customer return belongs to the original holder's count, not this customer's.
         if (item.returned_on_behalf_of) continue;
         totalReceived += qty;
         if (serial) net[serial] = (net[serial] || 0) - qty;
-        else bulk -= qty;
       }
     }
   }
@@ -71,7 +69,7 @@ function computeHoldings(bills) {
   return {
     totalGiven,
     totalReceived,
-    held: heldSerials.length + Math.max(0, bulk),
+    held: heldSerials.length,
     totalBillAmount,
     heldSerials,
     breakdown: Object.values(byKey)

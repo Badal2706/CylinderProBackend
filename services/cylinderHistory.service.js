@@ -50,6 +50,22 @@ async function getHistory(userId, cylinderId) {
     .limit(CAP)
     .lean();
 
+  // document_ref is the bill number as it stood when the event was logged. Resolve each one to its
+  // bill so the popup shows the CURRENT number (bills can be renumbered afterwards) plus that
+  // bill's challan number. Old numbers are matched through bill_number_history.
+  const Bill = require('../models/Bill');
+  const refs = [...new Set(rows.map(r => r.document_ref).filter(Boolean))];
+  const byRef = {};
+  if (refs.length) {
+    const bills = await Bill.find(
+      { user_id: userId, $or: [{ bill_number: { $in: refs } }, { 'bill_number_history.old_value': { $in: refs } }] },
+      { bill_number: 1, challan_no: 1, bill_number_history: 1 }
+    ).lean();
+    // Map historical numbers first, then current ones, so a current number always wins a collision.
+    for (const b of bills) (b.bill_number_history || []).forEach(h => { if (h.old_value) byRef[h.old_value] = b; });
+    for (const b of bills) byRef[b.bill_number] = b;
+  }
+
   return {
     cylinder: {
       rotational_number: cyl.rotational_number,
@@ -73,7 +89,9 @@ async function getHistory(userId, cylinderId) {
       from_state: r.from_state || '',
       to_state: r.to_state || '',
       customer_name: r.customer_name || '',
-      document_ref: r.document_ref || ''
+      // Current bill number (falls back to the logged snapshot if the bill is gone) + its challan.
+      document_ref: (byRef[r.document_ref] && byRef[r.document_ref].bill_number) || r.document_ref || '',
+      challan_no: (byRef[r.document_ref] && byRef[r.document_ref].challan_no) || ''
     }))
   };
 }

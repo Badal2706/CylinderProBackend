@@ -22,7 +22,9 @@ async function getCustomerLedgerData(userId) {
   const [billsByCustomer, paymentAgg] = await Promise.all([
     Bill.find({ customer_id: { $in: customerIds }, user_id: userId },
       { customer_id: 1, total_bill_amount: 1,
+        // serial_number is REQUIRED: computeHoldings counts holdings per serial.
         'line_items.direction': 1, 'line_items.quantity': 1, 'line_items.amount': 1,
+        'line_items.serial_number': 1,
         'line_items.returned_via': 1, 'line_items.returned_on_behalf_of': 1 }).lean(),
     Payment.aggregate([
       { $match: { customer_id: { $in: customerIds }, user_id: toOid(userId) } },

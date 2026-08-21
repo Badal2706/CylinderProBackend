@@ -170,6 +170,20 @@ async function generateBillNumber() {
   return peekNextBillNumber();
 }
 
+// Business timezone. A naive datetime string ("2026-08-20T16:53" — no Z, no offset) is a LOCAL
+// wall-clock from the operator's browser; Mongoose would parse it as UTC, shifting the bill +5:30
+// into the future and corrupting the effective-time ordering that drives cylinder state. The
+// frontend now always sends a real UTC instant, but a browser running cached older JS still could
+// not, so normalize here too. Date-only values ("2026-08-20") keep their existing meaning.
+const IST_OFFSET_MS = 330 * 60 * 1000;
+function normalizeBillDate(v) {
+  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(v)) {
+    const asUtc = new Date(`${v}Z`);
+    if (!isNaN(asUtc.getTime())) return new Date(asUtc.getTime() - IST_OFFSET_MS);
+  }
+  return v;
+}
+
 // Find the current holder of a cylinder = the most recent GIVEN line for that rotational number
 // that has NOT yet been marked returned. Returns { bill, line } (bill.customer_id populated) or null.
 // excludeBillId skips the just-created bill (so a swap round-trip's own GIVEN line isn't treated as the holder).
@@ -405,7 +419,8 @@ async function resolveDraft(userId, draft_id) {
 //            from_location, to_location, serial_numbers: [rotational numbers], remarks }
 // No customer, no amounts. The post-save hook moves each cylinder's location; stock_state untouched.
 async function createInternalTransfer(userId, body) {
-  const { bill_date, challan_no, from_location, to_location, serial_numbers, remarks } = body;
+  const { challan_no, from_location, to_location, serial_numbers, remarks } = body;
+  const bill_date = normalizeBillDate(body.bill_date);
 
   if (!LOCATIONS.includes(from_location)) throw new HttpError(400, 'A valid From location is required');
   if (!LOCATIONS.includes(to_location)) throw new HttpError(400, 'A valid To location is required');
@@ -532,11 +547,11 @@ async function createBill(userId, body, stepUp = null) {
     return createInternalTransfer(userId, body);
   }
 
+  const bill_date = normalizeBillDate(body.bill_date);
   const {
     customer_id,
     customer_type,
     one_time_customer,
-    bill_date,
     transaction_type,
     challan_no,
     location,
@@ -946,6 +961,10 @@ async function createBill(userId, body, stepUp = null) {
   // record it as returned on the holder's (Customer A's) behalf, and mark A's original GIVEN
   // line as returned so A's holding is reduced — exactly as if A had returned it directly.
   const crossReturns = []; // for the response: which cylinders settled / couldn't be settled
+  // Saving another customer's bill below re-fires its post-save hook, which re-applies THAT bill's
+  // movements to EVERY serial on it — rewinding unrelated cylinders to that old bill's state. Track
+  // those serials so the Phase 34 replay below restores them.
+  const settlementTouched = new Set();
   if (received_items && received_items.length) {
     const me = await Customer.findById(finalCustomerId); // Customer B (on this bill)
     let billDirty = false;
@@ -968,6 +987,7 @@ async function createBill(userId, body, stepUp = null) {
       holderRec.line.returned_via = finalCustomerId;
       holderRec.line.returned_via_name = me ? me.company_name : '';
       holderRec.line.returned_date = bill.bill_date;
+      (holderRec.bill.line_items || []).forEach(l => { if (l.serial_number) settlementTouched.add(l.serial_number); });
       await holderRec.bill.save();
 
       crossReturns.push({ serial: rline.serial_number, on_behalf_of: holder.company_name });
@@ -1031,7 +1051,7 @@ async function createBill(userId, body, stepUp = null) {
 
   // Phase 34: recompute live state from full history for every serial this bill touched, so an
   // out-of-order (backdated) save never leaves a cylinder reflecting this bill instead of a newer one.
-  try { await recomputeCylinderState(userId, [...givenSerials, ...receivedSerials]); } catch (e) { /* non-fatal */ }
+  try { await recomputeCylinderState(userId, [...givenSerials, ...receivedSerials, ...settlementTouched]); } catch (e) { /* non-fatal */ }
 
   return {
     bill_id: bill._id,
@@ -1050,7 +1070,8 @@ async function createBill(userId, body, stepUp = null) {
 // lock and log to edit_history when logEdit is set.
 async function updateInternalTransfer(user, bill, body, stepUp = null) {
   const uid = user.id;
-  const { bill_number, bill_date, challan_no, serial_numbers, personal_items, logEdit } = body;
+  const { bill_number, challan_no, serial_numbers, personal_items, logEdit } = body;
+  const bill_date = normalizeBillDate(body.bill_date);
   // Snapshot the serials on the transfer BEFORE any edit, so Phase 34 recompute also refreshes
   // any cylinder dropped from the transfer (bill.line_items is reassigned below).
   const oldTransferSerials = [...new Set(bill.line_items.map(l => l.serial_number).filter(Boolean))];
@@ -1255,7 +1276,8 @@ async function updateBill(user, billId, body, stepUp = null) {
   // logEdit=false → silent same-session correction from the success screen (no audit entry).
   // line_items === undefined → keep the existing lines untouched (bill-number-only edits,
   // which stay allowed even after the 3-day lock).
-  const { bill_date, bill_number, challan_no, transaction_type, line_items, logEdit } = body;
+  const { bill_number, challan_no, transaction_type, line_items, logEdit } = body;
+  const bill_date = normalizeBillDate(body.bill_date);
   const vehicle_number = body.vehicle_number; // Phase 27: optional, editable
   const keepLines = line_items === undefined;
   if (!keepLines && (!Array.isArray(line_items) || line_items.length === 0)) {
@@ -1471,6 +1493,10 @@ async function deleteBill(uid, billId, stepUp = null) {
 
   // Undo cross-customer return annotations this bill's RECEIVED lines created on the
   // original holder's GIVEN lines (the return never happened once this bill is gone).
+  // Re-saving a holder's bill re-fires its post-save hook across EVERY serial on it, so collect
+  // those serials for the Phase 34 replay below (otherwise unrelated cylinders keep that old
+  // bill's state).
+  const settlementTouched = new Set();
   for (const line of bill.line_items) {
     if (line.direction !== 'RECEIVED' || !line.returned_on_behalf_of) continue;
     const holderBills = await Bill.find({
@@ -1485,7 +1511,10 @@ async function deleteBill(uid, billId, stepUp = null) {
           l.returned_via = null; l.returned_via_name = null; l.returned_date = null; dirty = true;
         }
       });
-      if (dirty) await hb.save(); // hook re-marks those cylinders as held again
+      if (dirty) {
+        (hb.line_items || []).forEach(l => { if (l.serial_number) settlementTouched.add(l.serial_number); });
+        await hb.save(); // hook re-marks those cylinders as held again
+      }
     }
   }
 
@@ -1539,7 +1568,7 @@ async function deleteBill(uid, billId, stepUp = null) {
   try { await recomputeLocationPcStock(uid); } catch (e) { /* non-fatal */ }
   // Phase 34: with the bill gone, each touched serial's authoritative state = replay of its
   // REMAINING bills (supersedes the best-effort per-serial revert above).
-  try { await recomputeCylinderState(uid, serials); } catch (e) { /* non-fatal */ }
+  try { await recomputeCylinderState(uid, [...serials, ...settlementTouched]); } catch (e) { /* non-fatal */ }
 
   return { message: `Bill ${bill.bill_number} deleted`, bill_number: bill.bill_number };
 }

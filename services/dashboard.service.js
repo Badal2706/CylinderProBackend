@@ -108,7 +108,9 @@ async function getOverLimitCustomers(uid) {
   const allBills = await Bill.find(
     { customer_id: { $in: customerIds }, user_id: uid },
     { customer_id: 1,
+      // serial_number is REQUIRED: computeHoldings counts holdings per serial.
       'line_items.direction': 1, 'line_items.quantity': 1, 'line_items.amount': 1,
+      'line_items.serial_number': 1,
       'line_items.returned_via': 1, 'line_items.returned_on_behalf_of': 1 }
   ).lean();
 
