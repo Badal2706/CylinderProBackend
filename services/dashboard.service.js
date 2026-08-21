@@ -108,9 +108,10 @@ async function getOverLimitCustomers(uid) {
   const allBills = await Bill.find(
     { customer_id: { $in: customerIds }, user_id: uid },
     { customer_id: 1,
-      // serial_number is REQUIRED: computeHoldings counts holdings per serial.
+      // computeHoldings reads the LATEST event per serial — it needs the ordering fields too.
+      bill_date: 1, createdAt: 1, finalized_at: 1, 'line_items.added_at': 1, 
       'line_items.direction': 1, 'line_items.quantity': 1, 'line_items.amount': 1,
-      'line_items.serial_number': 1,
+      'line_items.serial_number': 1, 'line_items.gas_type_name': 1, 'line_items.size_label': 1,
       'line_items.returned_via': 1, 'line_items.returned_on_behalf_of': 1 }
   ).lean();
 
@@ -124,7 +125,7 @@ async function getOverLimitCustomers(uid) {
   const overLimitCustomers = [];
   for (const customer of customers) {
     const cid = String(customer._id);
-    const { held } = computeHoldings(billMap[cid] || []);
+    const { held } = computeHoldings(billMap[cid] || [], { isVendor: !!customer.is_filling_vendor });
     if (held > (customer.holding_limit || 0)) {
       overLimitCustomers.push({
         customer_id: customer._id,

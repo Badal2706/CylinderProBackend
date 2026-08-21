@@ -22,9 +22,10 @@ async function getCustomerLedgerData(userId) {
   const [billsByCustomer, paymentAgg] = await Promise.all([
     Bill.find({ customer_id: { $in: customerIds }, user_id: userId },
       { customer_id: 1, total_bill_amount: 1,
-        // serial_number is REQUIRED: computeHoldings counts holdings per serial.
+        // computeHoldings reads the LATEST event per serial — it needs the ordering fields too.
+        bill_date: 1, createdAt: 1, finalized_at: 1, 'line_items.added_at': 1, 
         'line_items.direction': 1, 'line_items.quantity': 1, 'line_items.amount': 1,
-        'line_items.serial_number': 1,
+        'line_items.serial_number': 1, 'line_items.gas_type_name': 1, 'line_items.size_label': 1,
         'line_items.returned_via': 1, 'line_items.returned_on_behalf_of': 1 }).lean(),
     Payment.aggregate([
       { $match: { customer_id: { $in: customerIds }, user_id: toOid(userId) } },
@@ -44,7 +45,7 @@ async function getCustomerLedgerData(userId) {
   return customers.map(customer => {
     const cid = String(customer._id);
     const bills = billMap[cid] || [];
-    const { held: cylindersHeld } = computeHoldings(bills);
+    const { held: cylindersHeld } = computeHoldings(bills, { isVendor: !!customer.is_filling_vendor });
     const totalBilled = bills.reduce((sum, bill) => sum + (bill.total_bill_amount || 0), 0);
     const totalPaid = payMap[cid] || 0;
 

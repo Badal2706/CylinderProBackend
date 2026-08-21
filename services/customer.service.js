@@ -13,9 +13,12 @@ const liGas = (item) => item.gas_type_name || (item.gas_type_id && item.gas_type
 const liSize = (item) => item.size_label || (item.cylinder_size_id && item.cylinder_size_id.size_label) || '';
 
 async function getCustomerStats(customerId) {
-  const bills = await Bill.find({ customer_id: customerId });
+  const [bills, cust] = await Promise.all([
+    Bill.find({ customer_id: customerId }),
+    Customer.findById(customerId).select('is_filling_vendor').lean()
+  ]);
 
-  const { totalGiven, totalReceived, held, totalBillAmount } = computeHoldings(bills);
+  const { totalGiven, totalReceived, held, totalBillAmount } = computeHoldings(bills, { isVendor: !!(cust && cust.is_filling_vendor) });
 
   const payments = await Payment.find({ customer_id: customerId });
   // Phase 14 (final): Total Received = Σ NET amount per payment (Amount Received − Discount);
@@ -76,9 +79,11 @@ async function listCustomers(userId, { search, status, page, limit, include_hidd
     Bill.find(
       { customer_id: { $in: customerIds } },
       { customer_id: 1, total_bill_amount: 1,
-        // serial_number is REQUIRED: computeHoldings counts holdings per serial.
+        // computeHoldings reads the LATEST event per serial, so it needs the serial AND the
+        // fields that order events (bill_date / createdAt / finalized_at / added_at).
+        bill_date: 1, createdAt: 1, finalized_at: 1, 'line_items.added_at': 1, 
         'line_items.direction': 1, 'line_items.quantity': 1, 'line_items.amount': 1,
-        'line_items.serial_number': 1,
+        'line_items.serial_number': 1, 'line_items.gas_type_name': 1, 'line_items.size_label': 1,
         'line_items.returned_via': 1, 'line_items.returned_on_behalf_of': 1 }
     ).lean().then(allBills => {
       const map = {};
@@ -108,7 +113,7 @@ async function listCustomers(userId, { search, status, page, limit, include_hidd
     const cid = String(customer._id);
     const bs = billStats[cid] || { bills: [], totalBillAmount: 0 };
     const ps = paymentStats[cid] || { totalNetReceived: 0, totalDiscount: 0 };
-    const { held, totalGiven, totalReceived } = computeHoldings(bs.bills);
+    const { held, totalGiven, totalReceived } = computeHoldings(bs.bills, { isVendor: !!customer.is_filling_vendor });
     return {
       ...customer,
       customer_id: cid,
@@ -147,7 +152,8 @@ async function getCustomerDetail(userId, customerId) {
 
   const [bills, payments] = await Promise.all([
     Bill.find({ customer_id: customer._id, user_id: userId },
-      { line_items: 1, bill_date: 1, bill_number: 1, challan_no: 1, total_bill_amount: 1 }
+      // createdAt/finalized_at order the events computeHoldings reads (see holdings.service).
+      { line_items: 1, bill_date: 1, createdAt: 1, finalized_at: 1, bill_number: 1, challan_no: 1, total_bill_amount: 1 }
     ).lean(),
     Payment.find({ customer_id: customer._id },
       { amount_received: 1, discount: 1 }
@@ -155,12 +161,11 @@ async function getCustomerDetail(userId, customerId) {
   ]);
 
   const { totalGiven, totalReceived, held: cylindersHeld, totalBillAmount,
-    breakdown: heldBreakdown } = computeHoldings(bills);
+    breakdown: heldBreakdown, heldSerials } = computeHoldings(bills, { isVendor: !!customer.is_filling_vendor });
   const totalNetReceived = payments.reduce((sum, p) => sum + (p.amount_received || 0) - (p.discount || 0), 0);
   const totalDiscount = payments.reduce((sum, p) => sum + (p.discount || 0), 0);
 
   const breakdown = {};
-  const heldNet = {};
   const heldInfo = {};
 
   for (const bill of bills) {
@@ -178,9 +183,9 @@ async function getCustomerDetail(userId, customerId) {
         breakdown[key].total_received += item.quantity;
       }
 
+      // Details for the held-cylinder table, taken from each serial's most recent issue.
       const s = item.serial_number;
-      if (item.direction === 'GIVEN' && !item.returned_via) {
-        heldNet[s] = (heldNet[s] || 0) + item.quantity;
+      if (s && item.direction === 'GIVEN' && !item.returned_via) {
         const t = new Date(bill.bill_date).getTime();
         if (!heldInfo[s] || t >= heldInfo[s]._t) {
           heldInfo[s] = {
@@ -189,14 +194,15 @@ async function getCustomerDetail(userId, customerId) {
             challan_no: bill.challan_no || '', rate: item.rate || 0, _t: t
           };
         }
-      } else if (item.direction === 'RECEIVED' && !item.returned_on_behalf_of) {
-        heldNet[s] = (heldNet[s] || 0) - item.quantity;
       }
     }
   }
 
-  const held_cylinders = Object.keys(heldNet)
-    .filter(s => heldNet[s] > 0)
+  // The table lists exactly the serials computeHoldings counted, so the number in the heading can
+  // never disagree with the rows under it. (It used to net quantities here independently, which
+  // dropped a cylinder issued today if the same serial had been returned at some earlier point.)
+  const held_cylinders = heldSerials
+    .filter(s => heldInfo[s])
     .map(s => { const { _t, ...rest } = heldInfo[s]; return rest; })
     .sort((a, b) => new Date(b.date_given) - new Date(a.date_given));
 
