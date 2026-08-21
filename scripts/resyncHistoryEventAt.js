@@ -11,6 +11,7 @@ const mongoose = require('mongoose');
 const connectDB = require('../config/mongodb');
 const Bill = require('../models/Bill');
 const CylinderHistory = require('../models/CylinderHistory');
+const { lineEffTime } = require('../services/cylinderState.service');
 
 const DRY = process.env.DRY === '1';
 const key = (u, ref) => `${u}|${ref}`;
@@ -19,7 +20,7 @@ const key = (u, ref) => `${u}|${ref}`;
   await connectDB();
 
   const bills = await Bill.find({ is_draft: { $ne: true } },
-    { user_id: 1, bill_number: 1, bill_date: 1, 'line_items.serial_number': 1, 'line_items.added_at': 1 }).lean();
+    { user_id: 1, bill_number: 1, bill_date: 1, finalized_at: 1, 'line_items.serial_number': 1, 'line_items.added_at': 1 }).lean();
   const billMap = {};
   for (const b of bills) {
     const addedByRot = {};
@@ -27,7 +28,7 @@ const key = (u, ref) => `${u}|${ref}`;
       const s = (li.serial_number || '').trim();
       if (s && li.added_at && !addedByRot[s]) addedByRot[s] = li.added_at;
     }
-    billMap[key(b.user_id, b.bill_number)] = { bill_date: b.bill_date, addedByRot };
+    billMap[key(b.user_id, b.bill_number)] = { bill_date: b.bill_date, addedByRot, billDoc: b };
   }
 
   const rows = await CylinderHistory.find(
@@ -40,7 +41,8 @@ const key = (u, ref) => `${u}|${ref}`;
   for (const r of rows) {
     const bm = billMap[key(r.user_id, r.document_ref)];
     if (!bm) { unresolved++; continue; }
-    const eff = new Date(bm.addedByRot[(r.rotational_number || '').trim()] || bm.bill_date);
+    const added = bm.addedByRot[(r.rotational_number || '').trim()];
+    const eff = added ? new Date(added) : lineEffTime(bm.billDoc, null);
     if (Math.abs(new Date(r.event_at).getTime() - eff.getTime()) <= 1000) continue; // already aligned
     if (samples.length < 12) samples.push(
       `${r.document_ref} cyl ${r.rotational_number} ${r.event_type}: ${new Date(r.event_at).toISOString()} -> ${eff.toISOString()}`);

@@ -91,6 +91,15 @@ const billSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Mixed,
     default: null
   },
+  // When a save-for-later draft was actually committed. A draft is written up front but completed
+  // later — often after other entries have already been made — and that completion is the moment it
+  // takes effect, so the cylinder replay orders it there rather than at its (earlier) bill_date.
+  // Null for bills saved outright. Only honoured on the same IST day, so a deliberately backdated
+  // draft still keeps its chosen date (see lineEffTime).
+  finalized_at: {
+    type: Date,
+    default: null
+  },
   customer_id: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Customer',

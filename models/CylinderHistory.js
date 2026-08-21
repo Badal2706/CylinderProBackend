@@ -32,11 +32,16 @@ const cylinderHistorySchema = new mongoose.Schema({
   // performed the action. performed_at_location keeps that site for a clean fallback label.
   performed_by: { type: String, default: '' },
   performed_at_location: { type: String, enum: [...LOCATIONS, ''], default: '' },
+  // Order WITHIN one instant. A swap logs two lines for the same cylinder at the same moment; the
+  // one that decides where the cylinder ends up must read as the later of the two (a vendor round
+  // trip goes out empty, comes back filled — so RECEIVED is last; a customer round trip is the
+  // reverse). 0 = first, 1 = second.
+  seq: { type: Number, default: 0 },
   // When the event happened (may differ from createdAt for back-dated fills / the migration).
   event_at: { type: Date, default: Date.now }
 }, { timestamps: true });
 
 // Newest-first per cylinder — powers both the popup read and the rolling-cap trim.
-cylinderHistorySchema.index({ user_id: 1, cylinder_id: 1, event_at: -1, createdAt: -1 });
+cylinderHistorySchema.index({ user_id: 1, cylinder_id: 1, event_at: -1, seq: -1, createdAt: -1 });
 
 module.exports = mongoose.model('CylinderHistory', cylinderHistorySchema);

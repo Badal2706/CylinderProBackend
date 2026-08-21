@@ -19,9 +19,26 @@ async function fillingVendorIds(userId) {
 
 const CH = 'AT_PLANT_CHANDISAR';
 
+// IST calendar day of an instant — the business day an entry belongs to.
+const istDay = (d) => new Date(new Date(d).getTime() + 330 * 60000).toISOString().slice(0, 10);
+
 // Effective time of one line for ordering: when it physically took effect.
+//   1. The line's own added_at — it was put on this bill during a later edit (Phase 35).
+//   2. The bill's finalized_at — a save-for-later draft is written up front but COMMITTED later,
+//      often after other entries have already been made. The vehicle case: Palanpur starts the
+//      transfer as a draft, cylinders collected en route are entered as customer receives, then
+//      Chandisar opens the draft, adds those cylinders and commits it. The commit is a correction
+//      and must outrank the receives made in between. Only honoured when the commit falls on the
+//      SAME IST day as the bill's date, so a deliberately backdated draft keeps its chosen date.
+//   3. Otherwise the bill's own date.
 function lineEffTime(bill, line) {
-  return line && line.added_at ? new Date(line.added_at) : new Date(bill.bill_date);
+  if (line && line.added_at) return new Date(line.added_at);
+  const bd = new Date(bill.bill_date);
+  if (bill.finalized_at) {
+    const fin = new Date(bill.finalized_at);
+    if (fin > bd && istDay(fin) === istDay(bd)) return fin;
+  }
+  return bd;
 }
 
 // Replay ONE serial's events to a final { state, holder } (holder = current customer when
@@ -44,8 +61,9 @@ function replaySerial(bills, rot, initial, cutoff, vendorIds) {
   for (const b of bills) {
     const lines = (b.line_items || []).filter(li => (li.serial_number || '').trim() === rot);
     if (!lines.length) continue;
-    // A line's own added_at wins; if several lines match (a swap), take the latest added_at present.
-    let eff = new Date(b.bill_date), sawAdded = false;
+    // Base = the bill's effective time (finalize-aware); a line's own added_at wins over it, and
+    // if several lines match (a swap) the latest added_at present is used.
+    let eff = lineEffTime(b, null), sawAdded = false;
     for (const li of lines) {
       if (li.added_at) { const t = new Date(li.added_at); if (!sawAdded || t > eff) { eff = t; sawAdded = true; } }
     }

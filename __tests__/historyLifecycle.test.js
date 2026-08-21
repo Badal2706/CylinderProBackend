@@ -164,3 +164,41 @@ describe('re-dating a bill is validated', () => {
     expect(new Date(moved.bill_date).toISOString()).toContain('2026-10-03');
   });
 });
+
+// A save-for-later bill is written up front but committed later — often after other entries have
+// already been made — and that commit is when it really takes effect. Ordering by bill_date alone
+// let an entry made in between outrank it (the vehicle case: Palanpur starts the transfer as a
+// draft, empties collected en route are received at Palanpur, then Chandisar commits the draft).
+describe('a draft takes effect when it is committed', () => {
+  const { lineEffTime } = require('../services/cylinderState.service');
+
+  test('commit time wins over the bill date on the same day', () => {
+    const bill = {
+      bill_date: new Date('2026-08-21T07:47:00Z'),      // 1:17 pm IST
+      finalized_at: new Date('2026-08-21T08:09:00Z')    // 1:39 pm IST — committed later
+    };
+    expect(lineEffTime(bill, null).toISOString()).toBe('2026-08-21T08:09:00.000Z');
+  });
+
+  test('a deliberately backdated draft keeps its own date', () => {
+    const bill = {
+      bill_date: new Date('2026-08-20T07:47:00Z'),      // yesterday
+      finalized_at: new Date('2026-08-21T08:09:00Z')    // committed today
+    };
+    expect(lineEffTime(bill, null).toISOString()).toBe('2026-08-20T07:47:00.000Z');
+  });
+
+  test('a line added during a later edit still wins over the commit time', () => {
+    const bill = {
+      bill_date: new Date('2026-08-21T07:47:00Z'),
+      finalized_at: new Date('2026-08-21T08:09:00Z')
+    };
+    const line = { added_at: new Date('2026-08-21T09:00:00Z') };
+    expect(lineEffTime(bill, line).toISOString()).toBe('2026-08-21T09:00:00.000Z');
+  });
+
+  test('a bill saved outright is unaffected', () => {
+    const bill = { bill_date: new Date('2026-08-21T07:47:00Z'), finalized_at: null };
+    expect(lineEffTime(bill, null).toISOString()).toBe('2026-08-21T07:47:00.000Z');
+  });
+});

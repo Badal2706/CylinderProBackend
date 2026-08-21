@@ -533,6 +533,8 @@ async function createInternalTransfer(userId, body) {
   Object.assign(bill, {
     is_draft: false,
     draft_payload: null,
+    // Committing a draft NOW — this is when the entry really lands (see lineEffTime).
+    finalized_at: draftDoc ? new Date() : null,
     transaction_category: 'INTERNAL_TRANSFER',
     customer_id: null,
     location: undefined,
@@ -959,6 +961,8 @@ async function createBill(userId, body, stepUp = null) {
   Object.assign(bill, {
     is_draft: false,
     draft_payload: null,
+    // Committing a draft NOW — this is when the entry really lands (see lineEffTime).
+    finalized_at: draftDoc ? new Date() : null,
     bill_number: billNumber,
     transaction_category: 'CUSTOMER',
     customer_id: finalCustomerId,
@@ -1063,6 +1067,15 @@ async function createBill(userId, body, stepUp = null) {
       custName = (one_time_customer && one_time_customer.company_name) || 'One-time customer';
     }
     const now = new Date();
+    // A serial on BOTH sides of this bill is a round trip logged at one instant. Order the pair so
+    // the direction that decides the outcome reads last: a vendor gets the cylinder EMPTY and
+    // returns it FILLED (RECEIVED last); a customer returns one and takes one (GIVEN last).
+    const bothSides = new Set(receivedSerials.filter(x => givenSerials.includes(x)));
+    const seqFor = (serial, dir) => {
+      if (!bothSides.has(serial)) return 0;
+      if (isVendor) return dir === 'GIVEN' ? 0 : 1;
+      return dir === 'RECEIVED' ? 0 : 1;
+    };
     const events = [];
     for (const s of receivedSerials) {
       const pre = cylByRot[s];
@@ -1076,7 +1089,8 @@ async function createBill(userId, body, stepUp = null) {
         from_location: pre.location, to_location: location,
         from_state: pre.stock_state, to_state: 'IN_STOCK',
         customer_name: custName, document_ref: bill.bill_number,
-        performed_by: performer, performed_at_location: location, event_at: bill.bill_date
+        performed_by: performer, performed_at_location: location, event_at: bill.bill_date,
+        seq: seqFor(s, 'RECEIVED')
       });
     }
     for (const s of givenSerials) {
@@ -1091,7 +1105,8 @@ async function createBill(userId, body, stepUp = null) {
         from_location: pre.location, to_location: location,
         from_state: pre.stock_state, to_state: 'AT_CUSTOMER',
         customer_name: custName, document_ref: bill.bill_number,
-        performed_by: performer, performed_at_location: location, event_at: bill.bill_date
+        performed_by: performer, performed_at_location: location, event_at: bill.bill_date,
+        seq: seqFor(s, 'GIVEN')
       });
     }
     await cylHistory.logEvents(events);

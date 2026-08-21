@@ -30,7 +30,7 @@ async function logEvents(entries) {
   for (const pair of pairs) {
     const [userId, cylinderId] = pair.split('|');
     const overflow = await CylinderHistory.find({ user_id: userId, cylinder_id: cylinderId })
-      .sort({ event_at: -1, createdAt: -1, _id: -1 })
+      .sort({ event_at: -1, seq: -1, createdAt: -1, _id: -1 })
       .skip(CAP)
       .select('_id')
       .lean();
@@ -66,7 +66,7 @@ async function getHistory(userId, cylinderId) {
   if (!cyl) throw new HttpError(404, 'Cylinder not found');
 
   const rows = await CylinderHistory.find({ user_id: userId, cylinder_id: cylinderId })
-    .sort({ event_at: -1, createdAt: -1, _id: -1 })
+    .sort({ event_at: -1, seq: -1, createdAt: -1, _id: -1 })
     .limit(CAP)
     .lean();
 

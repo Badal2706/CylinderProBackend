@@ -17,7 +17,7 @@ const DRY = process.env.DRY === '1';
   await connectDB();
 
   const cyls = await Cylinder.find({}, { rotational_number: 1, user_id: 1, location: 1, stock_state: 1 }).lean();
-  const bills = await Bill.find({ is_draft: { $ne: true } }, { user_id: 1, bill_number: 1, bill_date: 1, createdAt: 1, transaction_category: 1, location: 1, to_location: 1, line_items: 1, customer_id: 1 }).lean();
+  const bills = await Bill.find({ is_draft: { $ne: true } }, { user_id: 1, bill_number: 1, bill_date: 1, createdAt: 1, transaction_category: 1, location: 1, to_location: 1, line_items: 1, customer_id: 1, finalized_at: 1 }).lean();
 
   // Index bills by `${user}|${serial}`.
   const key = (u, r) => `${u}|${r}`;
