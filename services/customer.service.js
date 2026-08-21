@@ -152,7 +152,8 @@ async function getCustomerDetail(userId, customerId) {
     ).lean()
   ]);
 
-  const { totalGiven, totalReceived, held: cylindersHeld, totalBillAmount } = computeHoldings(bills);
+  const { totalGiven, totalReceived, held: cylindersHeld, totalBillAmount,
+    breakdown: heldBreakdown } = computeHoldings(bills);
   const totalNetReceived = payments.reduce((sum, p) => sum + (p.amount_received || 0) - (p.discount || 0), 0);
   const totalDiscount = payments.reduce((sum, p) => sum + (p.discount || 0), 0);
 
@@ -174,7 +175,6 @@ async function getCustomerDetail(userId, customerId) {
       } else if (!item.returned_on_behalf_of) {
         breakdown[key].total_received += item.quantity;
       }
-      breakdown[key].currently_held = breakdown[key].total_given - breakdown[key].total_received;
 
       const s = item.serial_number;
       if (item.direction === 'GIVEN' && !item.returned_via) {
@@ -197,6 +197,18 @@ async function getCustomerDetail(userId, customerId) {
     .filter(s => heldNet[s] > 0)
     .map(s => { const { _t, ...rest } = heldInfo[s]; return rest; })
     .sort((a, b) => new Date(b.date_given) - new Date(a.date_given));
+
+  // "Currently Holding" per gas/size comes from the same per-serial count as the headline figure
+  // and the held-cylinder list, so the three can never disagree. total_given/total_received stay
+  // as all-time quantity sums (the Total Filled / Total Empty columns).
+  for (const b of Object.values(breakdown)) b.currently_held = 0;
+  for (const h of heldBreakdown) {
+    const key = `${h.gas_type_name}-${h.size_label}`;
+    if (!breakdown[key]) {
+      breakdown[key] = { gas_type_name: h.gas_type_name, size_label: h.size_label, total_given: 0, total_received: 0, currently_held: 0 };
+    }
+    breakdown[key].currently_held = h.currently_held;
+  }
 
   const customerObj = customer.toObject();
   return {

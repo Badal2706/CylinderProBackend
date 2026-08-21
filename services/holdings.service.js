@@ -2,34 +2,80 @@
 // cylinders does this customer currently hold", used by the customers, dashboard,
 // and reports routes so they can never drift apart.
 //
-// Correctly accounts for cross-customer returns:
-//   held = Σ GIVEN.qty
-//        − Σ GIVEN.qty  where returned_via         (this customer's cylinder was returned via someone else)
-//        − Σ RECEIVED.qty where !returned_on_behalf_of  (count only this customer's own returns,
-//                                                        not cylinders they returned on another's behalf)
+// Holding is counted PER SERIAL, not as a running quantity total. A serial is held when its
+// net is positive:
+//   net(serial) = Σ GIVEN.qty   where !returned_via              (given to them and not returned)
+//               − Σ RECEIVED.qty where !returned_on_behalf_of    (only their own returns count,
+//                                                                 not ones made on another's behalf)
+//   held = number of serials with net > 0
 //
-// @param {Array} bills - the customer's bills (each with a line_items array)
-// @returns {{ totalGiven:number, totalReceived:number, held:number, totalBillAmount:number }}
+// Why per-serial and not a plain sum: a customer can legitimately return a cylinder that was
+// never recorded as GIVEN to them — issued before the software existed, or handed over informally.
+// Summing quantities lets those unmatched returns push the total below zero (a customer physically
+// holding 18 cylinders showing "-5"). Clamping per serial keeps the number equal to the actual
+// held-cylinder list, which is the physical truth. Unmatched returns still count in totalReceived,
+// so the all-time Filled/Empty figures are unaffected.
+//
+// @param {Array} bills - ONE customer's bills (each with a line_items array). Never mix customers:
+//                        netting is per serial, so another customer's return would cancel this
+//                        customer's issue.
+// @returns {{ totalGiven:number, totalReceived:number, held:number, totalBillAmount:number,
+//             heldSerials:string[], breakdown:Array<{gas_type_name,size_label,currently_held}> }}
 function computeHoldings(bills) {
   let totalGiven = 0;
   let totalReceived = 0;
   let totalBillAmount = 0;
 
+  const net = {};   // serial -> net quantity
+  const meta = {};  // serial -> { gas_type_name, size_label } from its most recent GIVEN
+  let bulk = 0;     // serial-less lines (personal-only lines carry quantity 0, so normally a no-op)
+
   for (const bill of (bills || [])) {
     for (const item of (bill.line_items || [])) {
+      const qty = item.quantity || 0;
+      const serial = item.serial_number;
       if (item.direction === 'GIVEN') {
-        totalGiven += item.quantity;
+        totalGiven += qty;
         totalBillAmount += item.amount;
         // A GIVEN cylinder marked returned (directly or via another customer) is no longer held.
-        if (item.returned_via) totalReceived += item.quantity;
+        if (item.returned_via) {
+          totalReceived += qty;
+        } else if (serial) {
+          net[serial] = (net[serial] || 0) + qty;
+          meta[serial] = { gas_type_name: item.gas_type_name || '', size_label: item.size_label || '' };
+        } else {
+          bulk += qty;
+        }
       } else if (item.direction === 'RECEIVED') {
         // A cross-customer return belongs to the original holder's count, not this customer's.
-        if (!item.returned_on_behalf_of) totalReceived += item.quantity;
+        if (item.returned_on_behalf_of) continue;
+        totalReceived += qty;
+        if (serial) net[serial] = (net[serial] || 0) - qty;
+        else bulk -= qty;
       }
     }
   }
 
-  return { totalGiven, totalReceived, held: totalGiven - totalReceived, totalBillAmount };
+  const heldSerials = Object.keys(net).filter(s => net[s] > 0);
+
+  // Per gas-type/size counts, derived from the same held serials so the breakdown always sums
+  // to the headline number.
+  const byKey = {};
+  for (const s of heldSerials) {
+    const { gas_type_name, size_label } = meta[s] || { gas_type_name: '', size_label: '' };
+    const key = `${gas_type_name}-${size_label}`;
+    if (!byKey[key]) byKey[key] = { gas_type_name, size_label, currently_held: 0 };
+    byKey[key].currently_held++;
+  }
+
+  return {
+    totalGiven,
+    totalReceived,
+    held: heldSerials.length + Math.max(0, bulk),
+    totalBillAmount,
+    heldSerials,
+    breakdown: Object.values(byKey)
+  };
 }
 
 module.exports = { computeHoldings };
