@@ -264,22 +264,53 @@ async function changePassword(userId, { current_password, new_password, confirm_
 
 async function getBusinessProfile(userId) {
   let profile = await BusinessProfile.findOne({ user_id: userId });
-  if (!profile) profile = { business_name: '', business_address: '', business_phone: '', gst_number: '', logo: '' };
+  // A user with no profile yet gets blanks, never a hardcoded business identity (Phase GEN-A).
+  if (!profile) {
+    profile = {
+      business_name: '', business_address: '', business_phone: '', gst_number: '',
+      certification_line: '', business_email: '', products_line: '', contact_lines: [],
+      logo_scale: 100, logo: ''
+    };
+  }
   return {
     business_name: profile.business_name || '',
     business_address: profile.business_address || '',
     business_phone: profile.business_phone || '',
     gst_number: profile.gst_number || '',
+    certification_line: profile.certification_line || '',
+    business_email: profile.business_email || '',
+    products_line: profile.products_line || '',
+    contact_lines: Array.isArray(profile.contact_lines) ? profile.contact_lines.map(String) : [],
+    logo_scale: Number(profile.logo_scale) > 0 ? Number(profile.logo_scale) : 100,
     logo: profile.logo || ''
   };
 }
 
-async function updateBusinessProfile(userId, { business_name, business_address, business_phone, gst_number, logo }) {
+async function updateBusinessProfile(userId, {
+  business_name, business_address, business_phone, gst_number,
+  certification_line, business_email, products_line, contact_lines, logo_scale, logo
+}) {
   const update = {};
   if (business_name !== undefined) update.business_name = business_name;
   if (business_address !== undefined) update.business_address = business_address;
   if (business_phone !== undefined) update.business_phone = business_phone;
   if (gst_number !== undefined) update.gst_number = gst_number;
+  if (certification_line !== undefined) update.certification_line = certification_line;
+  if (business_email !== undefined) update.business_email = business_email;
+  if (products_line !== undefined) update.products_line = products_line;
+  // Trailing blank boxes are dropped so an unused site never prints an empty line, but a blank
+  // BETWEEN two filled sites is kept — that is a deliberate spacer.
+  if (contact_lines !== undefined) {
+    const arr = (Array.isArray(contact_lines) ? contact_lines : []).map(v => String(v == null ? '' : v));
+    while (arr.length && !arr[arr.length - 1].trim()) arr.pop();
+    update.contact_lines = arr;
+  }
+  // Clamped rather than rejected: a stray value must never make the logo vanish or blow the
+  // header past one page.
+  if (logo_scale !== undefined) {
+    const n = Number(logo_scale);
+    update.logo_scale = Number.isFinite(n) ? Math.min(400, Math.max(25, Math.round(n))) : 100;
+  }
   if (logo !== undefined) update.logo = logo;
 
   const profile = await BusinessProfile.findOneAndUpdate(

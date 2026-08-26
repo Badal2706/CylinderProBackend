@@ -32,6 +32,10 @@ const phone = z.string().max(30).regex(/^[0-9+\-()\s]*$/, 'contains invalid char
 // enforced — existing customers include blanks, "URP", and legacy/non-conforming values, and the
 // challan already falls back to "URP". Enforcing the strict format here would reject saved records.
 const gstin = z.string().max(20).regex(/^[A-Za-z0-9]*$/, 'must be letters and digits only').optional().nullable();
+// Email: light format check only, blank allowed — same leniency as `phone`/`gstin` above. The
+// business email is letterhead text, not a login, so a legacy or unusual value must never be
+// rejected on save; anything containing a single @ with text either side passes.
+const email = z.string().max(200).regex(/^$|^[^@\s]+@[^@\s]+$/, 'must be a valid email address').optional().nullable();
 
 // Customers — create requires a company name; everything else optional/lenient.
 const customerCreate = z.object({
@@ -83,6 +87,13 @@ const businessProfile = z.object({
   business_address: optStr(1000),
   business_phone: phone,
   gst_number: gstin,
+  // Phase GEN-A letterhead lines — free text, length-bounded only. They print exactly as typed.
+  certification_line: optStr(300),
+  business_email: email,
+  products_line: optStr(300),
+  contact_lines: z.array(z.string().max(300, 'a contact line must be 300 characters or fewer'))
+    .max(20, 'too many contact lines').optional().nullable(),
+  logo_scale: optNumericLike,
   logo: z.string()
     .max(1_500_000, 'logo image is too large')
     .refine(v => v === '' || /^data:image\/(png|jpe?g|gif|webp|svg\+xml);base64,/.test(v),
