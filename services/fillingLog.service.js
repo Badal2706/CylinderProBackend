@@ -1,6 +1,7 @@
 const FillingLogEntry = require('../models/FillingLogEntry');
 const Cylinder = require('../models/Cylinder');
 const HttpError = require('../utils/HttpError');
+const locationService = require('./location.service');
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -12,13 +13,23 @@ async function logFillHistory(userId, items) {
   if (!list.length) return;
   try {
     const cylHistory = require('./cylinderHistory.service');
+    // GEN-B1: a fill happens at the user's filling location, not a hardcoded site. With none
+    // configured there is nothing truthful to record, so log nothing rather than stamp every
+    // fill with a site that does not fill — a mislabelled history entry is worse than none.
+    const { fillingLocationCode, labels } = await locationService.getUserLocations(userId);
+    if (!fillingLocationCode) {
+      console.error('logFillHistory: no filling location configured for user ' + userId +
+                    ' — FILLED history not recorded. Mark one location as the filling location.');
+      return;
+    }
+    const fillingLabel = labels[fillingLocationCode] || fillingLocationCode;
     const mgrMap = await cylHistory.getManagerMap(userId);
-    const performer = mgrMap['AT_PLANT_CHANDISAR'] || '';
+    const performer = mgrMap[fillingLocationCode] || '';
     await cylHistory.logEvents(list.map(it => ({
       user_id: userId, cylinder_id: it.cylinderId, rotational_number: it.rotational_number,
       event_type: 'FILLED',
-      description: `Filled at Chandisar Plant on ${it.date}`,
-      performed_by: performer, performed_at_location: 'AT_PLANT_CHANDISAR',
+      description: `Filled at ${fillingLabel} on ${it.date}`,
+      performed_by: performer, performed_at_location: fillingLocationCode,
       // event_at = the fill's day (the real event time); the entry's createdAt records when it was
       // typed. History shows both (Phase 34 item 5).
       event_at: new Date(it.date)

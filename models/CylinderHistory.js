@@ -1,5 +1,4 @@
 const mongoose = require('mongoose');
-const { LOCATIONS } = require('../config/locations');
 
 // ─── Phase 33: per-cylinder movement/action history ───
 // One document per event that changes or concerns a cylinder's state. Purely OBSERVATIONAL —
@@ -31,7 +30,9 @@ const cylinderHistorySchema = new mongoose.Schema({
   // "Performed by" = the site's Manager Name, resolved from whichever location's session
   // performed the action. performed_at_location keeps that site for a clean fallback label.
   performed_by: { type: String, default: '' },
-  performed_at_location: { type: String, enum: [...LOCATIONS, ''], default: '' },
+  // Phase GEN-B1: no enum — see LocationProfile. History is observational and must be able to
+  // record a location that has since been retired, so it never validates against the registry.
+  performed_at_location: { type: String, default: '' },
   // Order WITHIN one instant. A swap logs two lines for the same cylinder at the same moment; the
   // one that decides where the cylinder ends up must read as the later of the two (a vendor round
   // trip goes out empty, comes back filled — so RECEIVED is last; a customer round trip is the

@@ -4,7 +4,7 @@ const Cylinder = require('../models/Cylinder');
 const GasType = require('../models/GasType');
 const CylinderSize = require('../models/CylinderSize');
 const HttpError = require('../utils/HttpError');
-const { LOCATIONS, LOCATION_LABELS } = require('../config/locations');
+const locationService = require('./location.service');
 const { computeHoldings } = require('./holdings.service');
 const { recomputeLocationPcStock } = require('./pcStock.service');
 const { recomputeCylinderState, stateAsOf } = require('./cylinderState.service');
@@ -198,6 +198,8 @@ function normalizeBillDate(v) {
 // duplicate). Purely a log: the state itself is already put right by the replay.
 // `mode` is 'BILL_DELETED' or 'REMOVED_FROM_BILL'. event_at = now, because undoing it IS the event.
 async function logRemovalEvents(userId, bill, serials, mode) {
+  // GEN-B1: this user's location registry — replaces the static LOCATIONS/LOCATION_LABELS.
+  const { codes: validLocs, labels: locLabels } = await locationService.getUserLocations(userId);
   const list = [...new Set((serials || []).map(s => String(s || '').trim()).filter(Boolean))];
   if (!list.length) return;
   const cylHistory = require('./cylinderHistory.service');
@@ -216,8 +218,8 @@ async function logRemovalEvents(userId, bill, serials, mode) {
     event_type: mode,
     description: mode === 'BILL_DELETED'
       // The cylinder's place is recomputed from its remaining bills, so report where it ended up.
-      ? `Entry ${bill.bill_number} was deleted — cylinder reverted to ${LOCATION_LABELS[c.location] || c.location} (${c.stock_state === 'AT_CUSTOMER' ? 'with customer' : 'in stock'})`
-      : `Removed from entry ${bill.bill_number} — cylinder reverted to ${LOCATION_LABELS[c.location] || c.location} (${c.stock_state === 'AT_CUSTOMER' ? 'with customer' : 'in stock'})`,
+      ? `Entry ${bill.bill_number} was deleted — cylinder reverted to ${locLabels[c.location] || c.location} (${c.stock_state === 'AT_CUSTOMER' ? 'with customer' : 'in stock'})`
+      : `Removed from entry ${bill.bill_number} — cylinder reverted to ${locLabels[c.location] || c.location} (${c.stock_state === 'AT_CUSTOMER' ? 'with customer' : 'in stock'})`,
     to_location: c.location, to_state: c.stock_state,
     document_ref: bill.bill_number,
     performed_by: mgrMap[atSite] || '', performed_at_location: atSite || '',
@@ -269,6 +271,8 @@ async function countOwnReturns(userId, customerId, received_items) {
 // edited (same direction) is correctly in its current status BECAUSE of this bill, so it is exempt
 // from re-validation. Only newly-added cylinders are checked.
 async function validateCylinder(uid, { cylinderNo, direction, transactionId, customerId, location }) {
+  // GEN-B1: this user's location registry — replaces the static LOCATIONS/LOCATION_LABELS.
+  const { codes: validLocs, labels: locLabels } = await locationService.getUserLocations(uid);
   const rot = String(cylinderNo || '').trim();
   if (!rot) return { valid: true };
 
@@ -288,7 +292,7 @@ async function validateCylinder(uid, { cylinderNo, direction, transactionId, cus
 
   const billCustomerId = editingBill ? String(editingBill.customer_id) : (customerId ? String(customerId) : null);
   // Location the transaction happens at: from the bill being edited, else from the request.
-  const billLocation = editingBill ? editingBill.location : (LOCATIONS.includes(location) ? location : null);
+  const billLocation = editingBill ? editingBill.location : (validLocs.includes(location) ? location : null);
 
   if (direction === 'given') {
     if (cyl.stock_state === 'IN_STOCK') {
@@ -304,7 +308,7 @@ async function validateCylinder(uid, { cylinderNo, direction, transactionId, cus
         return {
           valid: false,
           warningOnly: false,
-          message: `${rot} is in stock at ${LOCATION_LABELS[cyl.location] || cyl.location} — it cannot be given from ${LOCATION_LABELS[billLocation]}. Transfer it first.`
+          message: `${rot} is in stock at ${locLabels[cyl.location] || cyl.location} — it cannot be given from ${locLabels[billLocation]}. Transfer it first.`
         };
       }
       return { valid: true }; // will be set AT_CUSTOMER on save
@@ -329,7 +333,7 @@ async function validateCylinder(uid, { cylinderNo, direction, transactionId, cus
     return {
       valid: false,
       warningOnly: false,
-      message: `${rot} is currently in stock (${LOCATION_LABELS[cyl.location] || cyl.location}) — it hasn't been given out, so it cannot be received.`
+      message: `${rot} is currently in stock (${locLabels[cyl.location] || cyl.location}) — it hasn't been given out, so it cannot be received.`
     };
   }
   // AT_CUSTOMER → allowed; if held by a DIFFERENT customer than this bill, it's a cross-customer return (warning).
@@ -460,11 +464,13 @@ async function resolveDraft(userId, draft_id) {
 //            from_location, to_location, serial_numbers: [rotational numbers], remarks }
 // No customer, no amounts. The post-save hook moves each cylinder's location; stock_state untouched.
 async function createInternalTransfer(userId, body) {
+  // GEN-B1: this user's location registry — replaces the static LOCATIONS/LOCATION_LABELS.
+  const { codes: validLocs, labels: locLabels } = await locationService.getUserLocations(userId);
   const { challan_no, from_location, to_location, serial_numbers, remarks } = body;
   const bill_date = normalizeBillDate(body.bill_date);
 
-  if (!LOCATIONS.includes(from_location)) throw new HttpError(400, 'A valid From location is required');
-  if (!LOCATIONS.includes(to_location)) throw new HttpError(400, 'A valid To location is required');
+  if (!validLocs.includes(from_location)) throw new HttpError(400, 'A valid From location is required');
+  if (!validLocs.includes(to_location)) throw new HttpError(400, 'A valid To location is required');
   if (from_location === to_location) throw new HttpError(400, 'From and To locations must be different');
   if (!challan_no || !String(challan_no).trim()) throw new HttpError(400, 'Challan number is required');
 
@@ -488,7 +494,7 @@ async function createInternalTransfer(userId, body) {
     if (cyl.stock_state !== 'IN_STOCK') throw new HttpError(400, `Cylinder "${s}" is with a customer and cannot be transferred.`);
     if (cyl.under_maintenance) throw new HttpError(400, `Cylinder "${s}" is under maintenance and cannot be transferred.`);
     if (cyl.location !== from_location) {
-      throw new HttpError(400, `Cylinder "${s}" is at ${LOCATION_LABELS[cyl.location] || cyl.location}, not ${LOCATION_LABELS[from_location]}.`);
+      throw new HttpError(400, `Cylinder "${s}" is at ${locLabels[cyl.location] || cyl.location}, not ${locLabels[from_location]}.`);
     }
   }
 
@@ -562,8 +568,8 @@ async function createInternalTransfer(userId, body) {
     const cylHistory = require('./cylinderHistory.service');
     const mgrMap = await cylHistory.getManagerMap(userId);
     const performer = mgrMap[from_location] || '';
-    const fromLabel = LOCATION_LABELS[from_location] || from_location;
-    const toLabel = LOCATION_LABELS[to_location] || to_location;
+    const fromLabel = locLabels[from_location] || from_location;
+    const toLabel = locLabels[to_location] || to_location;
     const now = new Date();
     await cylHistory.logEvents(serials.map(s => ({
       user_id: userId, cylinder_id: byRot[s]._id, rotational_number: s,
@@ -586,6 +592,8 @@ async function createInternalTransfer(userId, body) {
 }
 
 async function createBill(userId, body, stepUp = null) {
+  // GEN-B1: this user's location registry — replaces the static LOCATIONS/LOCATION_LABELS.
+  const { codes: validLocs, labels: locLabels } = await locationService.getUserLocations(userId);
   if (body.transaction_category === 'INTERNAL_TRANSFER') {
     return createInternalTransfer(userId, body);
   }
@@ -610,7 +618,7 @@ async function createBill(userId, body, stepUp = null) {
   }
 
   // Every customer transaction happens at one of our sites.
-  if (!LOCATIONS.includes(location)) {
+  if (!validLocs.includes(location)) {
     throw new HttpError(400, 'A valid location is required for the transaction');
   }
 
@@ -731,7 +739,7 @@ async function createBill(userId, body, stepUp = null) {
     if (m) return { loc: m.to_location || '', state: m.to_state || '', at: m.event_at ? new Date(m.event_at) : null };
     return { loc: cyl ? cyl.location : '', state: cyl ? cyl.stock_state : '', at: null }; // no placeholder → fall back to live
   }
-  const snapText = (m) => `${LOCATION_LABELS[m.loc] || m.loc || 'unknown'} / ${m.state === 'AT_CUSTOMER' ? 'with a customer' : 'in stock'}`;
+  const snapText = (m) => `${locLabels[m.loc] || m.loc || 'unknown'} / ${m.state === 'AT_CUSTOMER' ? 'with a customer' : 'in stock'}`;
   const isBackdatedPreSoftware = (m) => m.at && asOf < m.at; // entered before the migration snapshot time
 
   for (const s of givenSerials) {
@@ -749,7 +757,7 @@ async function createBill(userId, body, stepUp = null) {
         throw new HttpError(400, `Cylinder "${s}" was already with a customer${by} as of ${fmtDT(asOf)}${holder ? ` (bill ${holder.bill_number})` : ''} — it can't be given out then.`);
       }
       if (state.location !== location) {
-        throw new HttpError(400, `Cylinder "${s}" was in stock at ${LOCATION_LABELS[state.location] || state.location} as of ${fmtDT(asOf)}, not ${LOCATION_LABELS[location]} — transfer it there first.`);
+        throw new HttpError(400, `Cylinder "${s}" was in stock at ${locLabels[state.location] || state.location} as of ${fmtDT(asOf)}, not ${locLabels[location]} — transfer it there first.`);
       }
       // in stock at this location as of that date → OK
     } else {
@@ -761,7 +769,7 @@ async function createBill(userId, body, stepUp = null) {
         } else if (m.state !== 'IN_STOCK') {
           throw new HttpError(400, `Cylinder "${s}" is not available to give out (it is with a customer). Only in-stock cylinders can be given.`);
         } else {
-          throw new HttpError(400, `Cylinder "${s}" is in stock at ${LOCATION_LABELS[m.loc] || m.loc} — it cannot be given from ${LOCATION_LABELS[location]}. Transfer it to ${LOCATION_LABELS[location]} first.`);
+          throw new HttpError(400, `Cylinder "${s}" is in stock at ${locLabels[m.loc] || m.loc} — it cannot be given from ${locLabels[location]}. Transfer it to ${locLabels[location]} first.`);
         }
       }
     }
@@ -1056,7 +1064,7 @@ async function createBill(userId, body, stepUp = null) {
     const cylHistory = require('./cylinderHistory.service');
     const mgrMap = await cylHistory.getManagerMap(userId);
     const performer = mgrMap[location] || '';
-    const locLabel = LOCATION_LABELS[location] || location;
+    const locLabel = locLabels[location] || location;
     let custName = '', isVendor = false;
     if (finalCustomerId) {
       const custDoc = await Customer.findById(finalCustomerId).select('company_name is_filling_vendor').lean();
@@ -1133,6 +1141,8 @@ async function createBill(userId, body, stepUp = null) {
 // lock and log to edit_history when logEdit is set.
 async function updateInternalTransfer(user, bill, body, stepUp = null) {
   const uid = user.id;
+  // GEN-B1: this user's location registry — replaces the static LOCATIONS/LOCATION_LABELS.
+  const { codes: validLocs, labels: locLabels } = await locationService.getUserLocations(uid);
   const { bill_number, challan_no, serial_numbers, personal_items, logEdit } = body;
   const bill_date = normalizeBillDate(body.bill_date);
   // Snapshot the serials on the transfer BEFORE any edit, so Phase 34 recompute also refreshes
@@ -1173,7 +1183,7 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
   if (!keepLines) {
     const from_location = body.from_location !== undefined ? body.from_location : bill.from_location;
     const to_location = body.to_location !== undefined ? body.to_location : bill.to_location;
-    if (!LOCATIONS.includes(from_location) || !LOCATIONS.includes(to_location)) throw new HttpError(400, 'Valid From and To locations are required');
+    if (!validLocs.includes(from_location) || !validLocs.includes(to_location)) throw new HttpError(400, 'Valid From and To locations are required');
     if (from_location === to_location) throw new HttpError(400, 'From and To locations must be different');
     const newChallan = challan_no !== undefined ? String(challan_no).trim() : bill.challan_no;
     if (!newChallan) throw new HttpError(400, 'Challan number is required');
@@ -1204,7 +1214,7 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
       if (cyl.stock_state !== 'IN_STOCK') throw new HttpError(400, `Cylinder "${s}" is with a customer and cannot be transferred.`);
       if (cyl.under_maintenance) throw new HttpError(400, `Cylinder "${s}" is under maintenance and cannot be transferred.`);
       if (cyl.location !== from_location) {
-        throw new HttpError(400, `Cylinder "${s}" is at ${LOCATION_LABELS[cyl.location] || cyl.location}, not ${LOCATION_LABELS[from_location]}.`);
+        throw new HttpError(400, `Cylinder "${s}" is at ${locLabels[cyl.location] || cyl.location}, not ${locLabels[from_location]}.`);
       }
     }
 
@@ -1243,8 +1253,8 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
     const d2 = (d) => fmtIstDate(d);
     if (bill_date && d2(bill_date) !== d2(bill.bill_date)) changes.push(`Bill Date changed from ${d2(bill.bill_date)} to ${d2(bill_date)}`);
     if (challan_no !== undefined && newChallan !== bill.challan_no) changes.push(`Challan No. changed from ${bill.challan_no || '(none)'} to ${newChallan}`);
-    if (from_location !== bill.from_location) changes.push(`From changed to ${LOCATION_LABELS[from_location]}`);
-    if (to_location !== bill.to_location) changes.push(`To changed to ${LOCATION_LABELS[to_location]}`);
+    if (from_location !== bill.from_location) changes.push(`From changed to ${locLabels[from_location]}`);
+    if (to_location !== bill.to_location) changes.push(`To changed to ${locLabels[to_location]}`);
     const newSet = new Set(serials);
     oldSerials.forEach(s => { if (!newSet.has(s)) changes.push(`Cylinder ${s} removed`); });
     const addedSerials = serials.filter(s => !oldSerials.includes(s));
@@ -1252,8 +1262,8 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
     if (addedSerials.length) {
       addedCtx = {
         serials: addedSerials, byRot, from_location, to_location,
-        fromLabel: LOCATION_LABELS[from_location] || from_location,
-        toLabel: LOCATION_LABELS[to_location] || to_location
+        fromLabel: locLabels[from_location] || from_location,
+        toLabel: locLabels[to_location] || to_location
       };
     }
     const oldPc = bill.line_items.reduce((t, l) => t + (Number(l.personalCylindersIn) || 0), 0);
@@ -1333,6 +1343,8 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
 // `user` = req.user ({ id, name, email, ... }) — name/email are used in the edit_history entry.
 async function updateBill(user, billId, body, stepUp = null) {
   const uid = user.id;
+  // GEN-B1: this user's location registry — replaces the static LOCATIONS/LOCATION_LABELS.
+  const { codes: validLocs, labels: locLabels } = await locationService.getUserLocations(uid);
   const bill = await Bill.findOne({ _id: billId, user_id: uid });
   if (!bill) throw new HttpError(404, 'Bill not found');
 
@@ -1438,7 +1450,7 @@ async function updateBill(user, billId, body, stepUp = null) {
         }
         conflicts.push({ serial: s, problem: `was already out${by} on ${fmtIstDateTime(asOfNew)}, so it could not be given out then.` });
       } else if (l.direction === 'RECEIVED' && state.stock_state !== 'AT_CUSTOMER') {
-        conflicts.push({ serial: s, problem: `was already in stock at ${LOCATION_LABELS[state.location] || state.location} on ${fmtIstDateTime(asOfNew)}, so there was nothing to receive back.` });
+        conflicts.push({ serial: s, problem: `was already in stock at ${locLabels[state.location] || state.location} on ${fmtIstDateTime(asOfNew)}, so there was nothing to receive back.` });
       }
     }
     if (conflicts.length && !body.confirm_date_change) {
@@ -1697,7 +1709,9 @@ async function deleteBill(uid, billId, stepUp = null) {
 // A draft claims a REAL bill number (same sequence) and stores the raw new-transaction form
 // state in draft_payload. Scoped to the location it was created under.
 async function saveDraft(userId, { draft_id, location, payload }) {
-  if (!LOCATIONS.includes(location)) throw new HttpError(400, 'A valid location is required for a draft');
+  // GEN-B1: this user's location registry — replaces the static LOCATIONS/LOCATION_LABELS.
+  const { codes: validLocs, labels: locLabels } = await locationService.getUserLocations(userId);
+  if (!validLocs.includes(location)) throw new HttpError(400, 'A valid location is required for a draft');
   if (!payload || typeof payload !== 'object') throw new HttpError(400, 'Draft payload is required');
 
   let draft;
@@ -1730,8 +1744,10 @@ async function saveDraft(userId, { draft_id, location, payload }) {
 }
 
 async function listDrafts(userId, location) {
+  // GEN-B1: this user's location registry — replaces the static LOCATIONS/LOCATION_LABELS.
+  const { codes: validLocs, labels: locLabels } = await locationService.getUserLocations(userId);
   const query = { user_id: userId, is_draft: true };
-  if (LOCATIONS.includes(location)) query.location = location;
+  if (validLocs.includes(location)) query.location = location;
   const drafts = await Bill.find(query).sort('-updatedAt');
   return drafts.map(d => ({
     draft_id: d._id,

@@ -3,21 +3,46 @@ const Bill = require('../models/Bill');
 const HttpError = require('../utils/HttpError');
 const { normalizeGasTypeIn, normalizeCapacityIn } = require('../config/gasCapacities');
 const { getGasCapacities } = require('./masters.service');
-const { LOCATIONS, LOCATION_LABELS } = require('../config/locations');
+const locationService = require('./location.service');
 const { insertInBatches } = require('../utils/bulkInsert');
 
 // Human labels for the manual-edit history description.
 const STATE_LABEL = { IN_STOCK: 'In Stock', AT_CUSTOMER: 'At Customer' };
 
-// Accept friendly location spellings from forms/imports → canonical enum (or null if invalid).
-function normalizeLocation(v) {
-  const s = String(v == null ? '' : v).trim().toUpperCase().replace(/[\s-]+/g, '_');
+// Accept friendly location spellings from forms/imports → one of THIS user's location codes
+// (or null if it matches none). GEN-B1: async and registry-driven — the old version hardcoded
+// three substring checks, so a CSV naming a fourth site could never resolve.
+// Order: exact code, then the location's own label, then a loose contains-match on either. The
+// loose pass is what lets a CSV say "chandisar plant" or just "palanpur".
+const normKey = (v) => String(v == null ? '' : v).trim().toUpperCase().replace(/[\s-]+/g, '_');
+
+// Sync core: matches against an ALREADY-LOADED registry. Bulk callers (CSV import, up to 20k
+// rows) must load the registry once and use this, never the async wrapper per row — location
+// lookups are deliberately uncached, so one call per row would be one query per row.
+function matchLocation(registry, v) {
+  const s = normKey(v);
   if (!s) return null;
-  if (LOCATIONS.includes(s)) return s;
-  if (s.includes('CHANDISAR') || s.includes('PLANT')) return 'AT_PLANT_CHANDISAR';
-  if (s.includes('PALANPUR')) return 'AT_PALANPUR_OFFICE';
-  if (s.includes('CHHAPI')) return 'AT_CHHAPI_OFFICE';
+  const codes = (registry && registry.codes) || [];
+  const labels = (registry && registry.labels) || {};
+
+  if (codes.includes(s)) return s;                                  // exact code
+
+  for (const code of codes) {                                       // exact label
+    if (normKey(labels[code]) === s) return code;
+  }
+  for (const code of codes) {                                       // loose contains
+    const lab = normKey(labels[code]);
+    if (lab && (s.includes(lab) || lab.includes(s))) return code;
+    // Also match the distinctive words of the code, e.g. AT_PLANT_CHANDISAR -> PLANT, CHANDISAR.
+    const words = code.replace(/^AT_/, '').split('_').filter(w => w.length > 2);
+    if (words.some(w => s.includes(w))) return code;
+  }
   return null;
+}
+
+// Single-row convenience wrapper — loads the registry itself.
+async function normalizeLocation(userId, v) {
+  return matchLocation(await locationService.getUserLocations(userId), v);
 }
 
 // Accept friendly stock-state spellings → canonical enum (or null if invalid).
@@ -34,7 +59,7 @@ function normalizeStockState(v) {
 // calculation itself is untouched; this only narrows which rows are returned.
 async function getAgingReport(uid, { mode, minDays, maxDays, thresholdDays, sortBy, sortOrder, location }) {
   const cylQuery = { user_id: uid, stock_state: 'AT_CUSTOMER' };
-  if (location && LOCATIONS.includes(location)) cylQuery.location = location;
+  if (location && (await locationService.isValidLocation(uid, location))) cylQuery.location = location;
   const cylinders = await Cylinder.find(cylQuery).lean();
 
   const serials = cylinders.map(c => c.rotational_number);
@@ -195,8 +220,11 @@ async function setMaintenance(uid, id, on) {
 
   if (on) {
     if (cylinder.under_maintenance) throw new HttpError(400, 'Cylinder is already under maintenance');
-    if (cylinder.stock_state !== 'IN_STOCK' || cylinder.location !== 'AT_PLANT_CHANDISAR') {
-      throw new HttpError(400, 'Only cylinders in stock at Chandisar Plant can be put under maintenance');
+    // GEN-B1: anchored on the user's filling location, not a hardcoded site.
+    const { fillingLocationCode, labels } = await locationService.getUserLocations(uid);
+    const where = fillingLocationCode ? (labels[fillingLocationCode] || fillingLocationCode) : 'the filling location';
+    if (cylinder.stock_state !== 'IN_STOCK' || !fillingLocationCode || cylinder.location !== fillingLocationCode) {
+      throw new HttpError(400, `Only cylinders in stock at ${where} can be put under maintenance`);
     }
     cylinder.under_maintenance = true;
     cylinder.maintenance_since = new Date();
@@ -267,13 +295,20 @@ async function createCylinder(uid, { rotational_number, physical_number, gas_typ
     throw new HttpError(400, 'Rotational number, gas type, and capacity are all required');
   }
 
+  // A location that was supplied but resolves to nothing is an error, not a silent fall back to
+  // the default — same rule the CSV import already applied.
+  const resolvedLocation = await normalizeLocation(uid, location);
+  if (location && String(location).trim() && !resolvedLocation) {
+    throw new HttpError(400, `Unknown location "${location}"`);
+  }
+
   const cylinder = new Cylinder({
     user_id: uid,
     rotational_number,
     physical_number: (physical_number && physical_number.trim()) ? physical_number.trim() : undefined,
     gas_type,
     capacity,
-    location: normalizeLocation(location) || 'AT_PLANT_CHANDISAR',
+    location: resolvedLocation || 'AT_PLANT_CHANDISAR',
     stock_state: normalizeStockState(stock_state) || 'IN_STOCK',
     under_maintenance: !!under_maintenance,
     maintenance_since: under_maintenance ? new Date() : null
@@ -306,6 +341,8 @@ async function importCylinders(uid, rows) {
   const failed = [];
   const seenRot = new Set();
   const seenPhy = new Set();
+  // Loaded ONCE for the whole file — see matchLocation.
+  const locRegistry = await locationService.getUserLocations(uid);
 
   rows.forEach((r, i) => {
     const row = r.__row || (i + 2);
@@ -327,7 +364,7 @@ async function importCylinders(uid, rows) {
       seenPhy.add(phyKey);
     }
 
-    const loc = normalizeLocation(r.location);
+    const loc = matchLocation(locRegistry, r.location);
     if (str(r.location) && !loc) { failed.push({ row, reason: `Invalid location "${str(r.location)}"` }); return; }
     const stock = normalizeStockState(r.stock_state);
     if (str(r.stock_state) && !stock) { failed.push({ row, reason: `Invalid stock_state "${str(r.stock_state)}"` }); return; }
@@ -379,14 +416,28 @@ async function updateCylinder(uid, id, body) {
   const before = await Cylinder.findOne({ _id: id, user_id: uid });
   if (!before) throw new HttpError(404, 'Cylinder not found');
 
+  // ─── Location validity (GEN-B1) ───
+  // Until GEN-B1 the schema enum was the ONLY thing rejecting a bogus location here — this
+  // function passes `location` straight through to the update. With the enum gone, the check has
+  // to live here, or any string at all would be written to a cylinder.
+  if (updates.location !== undefined) {
+    if (!(await locationService.isValidLocation(uid, updates.location))) {
+      throw new HttpError(400, `Unknown location "${updates.location}"`);
+    }
+  }
+
   // ─── Gas-type / capacity edit gate (Phase 9) ───
-  // Same gate as the maintenance toggle: the cylinder must be IN_STOCK at Chandisar Plant.
+  // Same gate as the maintenance toggle: the cylinder must be IN_STOCK at the filling location.
   // Historical bills are unaffected either way — their line items carry name snapshots.
   if (updates.gas_type !== undefined || updates.capacity !== undefined) {
     const changingType = (updates.gas_type !== undefined && updates.gas_type !== before.gas_type) ||
                          (updates.capacity !== undefined && updates.capacity !== before.capacity);
-    if (changingType && (before.location !== 'AT_PLANT_CHANDISAR' || before.stock_state !== 'IN_STOCK')) {
-      throw new HttpError(400, 'Gas type / capacity can only be changed while the cylinder is In Stock at Chandisar Plant.');
+    if (changingType) {
+      const { fillingLocationCode, labels } = await locationService.getUserLocations(uid);
+      const where = fillingLocationCode ? (labels[fillingLocationCode] || fillingLocationCode) : 'the filling location';
+      if (!fillingLocationCode || before.location !== fillingLocationCode || before.stock_state !== 'IN_STOCK') {
+        throw new HttpError(400, `Gas type / capacity can only be changed while the cylinder is In Stock at ${where}.`);
+      }
     }
   }
 
@@ -407,12 +458,13 @@ async function updateCylinder(uid, id, body) {
   // Purely additive; a logging failure never fails the edit. "Performed by" resolves from the
   // active session's location (sent by the Cylinder Inventory edit form), falling back to Chandisar.
   try {
+    const { codes, labels } = await locationService.getUserLocations(uid);
     const diffs = [];
     if (updates.location !== undefined && cylinder.location !== before.location) {
       diffs.push({
         field: 'Location',
-        from: LOCATION_LABELS[before.location] || before.location,
-        to: LOCATION_LABELS[cylinder.location] || cylinder.location,
+        from: labels[before.location] || before.location,
+        to: labels[cylinder.location] || cylinder.location,
         from_location: before.location, to_location: cylinder.location
       });
     }
@@ -426,11 +478,13 @@ async function updateCylinder(uid, id, body) {
     }
     if (diffs.length) {
       const cylHistory = require('./cylinderHistory.service');
-      const activeLoc = LOCATIONS.includes(body.active_location) ? body.active_location : 'AT_PLANT_CHANDISAR';
+      const activeLoc = codes.includes(body.active_location)
+        ? body.active_location
+        : (codes[0] || 'AT_PLANT_CHANDISAR');
       const mgrMap = await cylHistory.getManagerMap(uid);
       const performer = mgrMap[activeLoc] || '';
-      const who = performer || (LOCATION_LABELS[activeLoc] || activeLoc);
-      const locLabel = LOCATION_LABELS[activeLoc] || activeLoc;
+      const who = performer || (labels[activeLoc] || activeLoc);
+      const locLabel = labels[activeLoc] || activeLoc;
       const now = new Date();
       await cylHistory.logEvents(diffs.map(d => ({
         user_id: uid, cylinder_id: cylinder._id, rotational_number: cylinder.rotational_number,
@@ -453,6 +507,9 @@ async function deleteCylinder(uid, id) {
 }
 
 module.exports = {
+  // Exported for tests and for bulk callers that resolve many rows against one loaded registry.
+  matchLocation,
+  normalizeLocation,
   getAgingReport,
   listCylinders,
   setMaintenance,

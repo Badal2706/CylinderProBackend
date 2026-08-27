@@ -1,5 +1,4 @@
 const mongoose = require('mongoose');
-const { LOCATIONS } = require('../config/locations');
 
 const billLineItemSchema = new mongoose.Schema({
   direction: {
@@ -107,20 +106,20 @@ const billSchema = new mongoose.Schema({
     required: function () { return !this.is_draft && this.transaction_category !== 'INTERNAL_TRANSFER'; }
   },
   // CUSTOMER bills: the site the transaction happened at (drafts are scoped by this too).
+  // Phase GEN-B1: no enum — locations are per-user and live in LocationProfile. Validity is
+  // checked in the service layer via location.service.isValidLocation(); a schema enum here
+  // would reject any location a user adds later.
   location: {
     type: String,
-    enum: LOCATIONS,
     required: function () { return this.transaction_category !== 'INTERNAL_TRANSFER'; }
   },
   // INTERNAL_TRANSFER bills: source and destination sites (must differ — enforced in the service).
   from_location: {
     type: String,
-    enum: LOCATIONS,
     required: function () { return this.transaction_category === 'INTERNAL_TRANSFER'; }
   },
   to_location: {
     type: String,
-    enum: LOCATIONS,
     required: function () { return this.transaction_category === 'INTERNAL_TRANSFER'; }
   },
   bill_date: {

@@ -1,5 +1,4 @@
 const mongoose = require('mongoose');
-const { LOCATIONS } = require('../config/locations');
 
 // Per-location personal-cylinder (PC) stock by gas+size (Phase 11). A separate, additional
 // tracked value alongside the per-customer PC balance (which remains the source of truth for
@@ -8,7 +7,9 @@ const { LOCATIONS } = require('../config/locations');
 //   internal transfer PC lines  → from_location −= qty, to_location += qty
 const locationPcStockSchema = new mongoose.Schema({
   user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-  location: { type: String, enum: LOCATIONS, required: true },
+  // Phase GEN-B1: no enum — see LocationProfile. Rows are derived from bills, whose locations
+  // the service layer has already validated.
+  location: { type: String, required: true },
   gas_type: { type: String, required: true },
   capacity: { type: String, required: true },
   qty: { type: Number, default: 0 }

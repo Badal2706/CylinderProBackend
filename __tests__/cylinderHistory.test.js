@@ -27,8 +27,10 @@ describe('Cylinder history (Phase 33)', () => {
   beforeAll(async () => {
     const user = await User.create({ name: 'Hist', email: 'hist@test.com', password: 'Test1234!' });
     uid = user._id;
+    // GEN-B1: the registry says which site fills. Filling history is only recorded for the
+    // location flagged here — an account with none configured logs no FILLED events.
     await LocationProfile.create([
-      { user_id: uid, location: 'AT_PLANT_CHANDISAR', manager_name: 'Ramesh' },
+      { user_id: uid, location: 'AT_PLANT_CHANDISAR', manager_name: 'Ramesh', is_filling_location: true },
       { user_id: uid, location: 'AT_PALANPUR_OFFICE', manager_name: 'Suresh' }
     ]);
     gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });

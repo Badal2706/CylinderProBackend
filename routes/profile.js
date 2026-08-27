@@ -24,6 +24,7 @@ router.get('/business', ctrl.getBusinessProfile);
 router.put('/business', requireStepUpAuth, validate(V.businessProfile), ctrl.updateBusinessProfile);
 router.get('/locations', ctrl.getLocationProfiles);
 // Phase 20: single shared save for all three location profiles.
+router.post('/locations', requireStepUpAuth, validate(V.locationCreate), ctrl.createLocationProfile);
 router.put('/locations', requireStepUpAuth, ctrl.updateLocationProfilesBatch);
 router.put('/locations/:location', requireStepUpAuth, ctrl.updateLocationProfile);
 router.get('/audit-log', ctrl.getAuditLog);

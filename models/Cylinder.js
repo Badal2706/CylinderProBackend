@@ -1,5 +1,4 @@
 const mongoose = require('mongoose');
-const { LOCATIONS } = require('../config/locations');
 
 const cylinderSchema = new mongoose.Schema({
   user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
@@ -26,9 +25,11 @@ const cylinderSchema = new mongoose.Schema({
   // Physical site the cylinder is at (or was last dispatched from, when AT_CUSTOMER).
   // Changed ONLY by the Bill post-save hook (CUSTOMER bills set it to the bill's site;
   // INTERNAL_TRANSFER bills move it from_location -> to_location).
+  // Phase GEN-B1: no enum — locations are per-user and live in LocationProfile. Validity is
+  // checked in the service layer via location.service.isValidLocation(); a schema enum here
+  // would reject any location a user adds later.
   location: {
     type: String,
-    enum: LOCATIONS,
     default: 'AT_PLANT_CHANDISAR'
   },
   // Whether the cylinder is in our stock or out with a customer. Derived from Bill saves.

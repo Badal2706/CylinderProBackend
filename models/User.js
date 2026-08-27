@@ -9,9 +9,11 @@ const userSchema = new mongoose.Schema({
   password: { type: String, required: true },
   phone: { type: String, default: '' },
   // Site the user is currently "operating as" — drives UI defaults only (never rewrites data).
+  // Phase GEN-B1: no enum — locations are per-user and live in LocationProfile. Validity is
+  // checked in the service layer via location.service.isValidLocation(); a schema enum here
+  // would reject any location a user adds later.
   active_location: {
     type: String,
-    enum: ['AT_PLANT_CHANDISAR', 'AT_PALANPUR_OFFICE', 'AT_CHHAPI_OFFICE'],
     default: 'AT_PLANT_CHANDISAR'
   },
   last_login: { type: Date },

@@ -125,7 +125,20 @@ const importRows = z.object({
   rows: z.array(z.any()).max(20000, 'too many rows in one import')
 }).passthrough();
 
+// Phase GEN-B2 — adding a location. The CODE is generated server-side from the label and is
+// permanent (R83); only the label and the editable side-fields arrive from the client.
+const locationCreate = z.object({
+  // reqStr allows whitespace-only; the service trims and rejects too, but catching it here gives
+  // a clean 400 instead of relying on the deeper check.
+  label: reqStr(80, 'Location name').refine(v => v.trim().length > 0, 'Location name is required'),
+  is_filling_location: z.boolean().optional(),
+  manager_name: optStr(200),
+  contact_number: optStr(300),
+  challan_prefix: optStr(20)
+}).passthrough();
+
 module.exports = {
+  locationCreate,
   customerCreate, customerUpdate,
   cylinderCreate, cylinderUpdate,
   paymentCreate,

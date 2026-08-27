@@ -1,6 +1,6 @@
 const Bill = require('../models/Bill');
 const LocationPcStock = require('../models/LocationPcStock');
-const { LOCATIONS } = require('../config/locations');
+const locationService = require('./location.service');
 
 // ─── Per-location PC stock (Phase 11, physical-custody model Phase 31) ───
 // Rebuilt from scratch on every bill mutation (createBill / createInternalTransfer /
@@ -35,9 +35,12 @@ async function recomputeLocationPcStock(userId) {
   const setCell = (combo, loc, qty) => { state[combo][loc] = qty; };
   const comboOf = (li) => `${li.gas_type_name || ''}|${li.size_label || ''}`;
 
+  // GEN-B1: validity from the user's registry. Loaded once — this loop runs over every bill.
+  const { codes: validLocs } = await locationService.getUserLocations(userId);
+
   for (const b of bills) {
     if (b.transaction_category === 'INTERNAL_TRANSFER') {
-      if (!LOCATIONS.includes(b.from_location) || !LOCATIONS.includes(b.to_location)) continue;
+      if (!validLocs.includes(b.from_location) || !validLocs.includes(b.to_location)) continue;
       for (const li of b.line_items) {
         const qty = Number(li.personalCylindersIn) || 0; // transfer PC qty rides here
         if (qty <= 0) continue;
@@ -49,7 +52,7 @@ async function recomputeLocationPcStock(userId) {
         setCell(combo, b.to_location, cell(combo, b.to_location) + move);
       }
     } else {
-      if (!LOCATIONS.includes(b.location)) continue;
+      if (!validLocs.includes(b.location)) continue;
       // Aggregate this bill's PC in/out per combo, then apply arrivals before departures so a
       // same-bill collect+return nets correctly and departures clamp at 0.
       const inBy = {}, outBy = {};
@@ -82,7 +85,7 @@ async function recomputeLocationPcStock(userId) {
 // Rows for display: [{ location, gas_type, capacity, qty }], optionally one location only.
 async function getPcStock(userId, location) {
   const q = { user_id: userId };
-  if (location && LOCATIONS.includes(location)) q.location = location;
+  if (location && (await locationService.isValidLocation(userId, location))) q.location = location;
   const rows = await LocationPcStock.find(q).sort('location gas_type capacity');
   return rows.map(r => ({ location: r.location, gas_type: r.gas_type, capacity: r.capacity, qty: r.qty }));
 }

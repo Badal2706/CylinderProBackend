@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const archiverLib = require('archiver');
 // Create a zip Archiver across archiver major versions. v7 and earlier export a callable factory
 // (`archiver('zip', opts)`). v8 is ESM-first and, under CommonJS require(), yields a namespace
@@ -22,7 +23,8 @@ const Cylinder = require('../models/Cylinder');
 const LocationProfile = require('../models/LocationProfile');
 const RentalCharge = require('../models/RentalCharge');
 const HttpError = require('../utils/HttpError');
-const { LOCATIONS } = require('../config/locations');
+const { LOCATIONS, LOCATION_LABELS } = require('../config/locations');
+const locationService = require('./location.service');
 
 // DD/MM/YYYY for exports
 const ddmmyyyy = (d) => {
@@ -55,44 +57,162 @@ async function getAccount(userId) {
 async function getLocationProfiles(userId) {
   const existing = await LocationProfile.find({ user_id: userId });
   const have = new Set(existing.map(p => p.location));
+  // config/locations.js is now ONLY a seed list for an account that has no registry yet — never
+  // the runtime source of truth. A user who later adds a fourth site keeps it; nothing here
+  // removes or re-adds anything once records exist.
   const missing = LOCATIONS.filter(l => !have.has(l));
   if (missing.length) {
     // Insert one at a time and tolerate races on the unique (user_id, location) index.
     for (const location of missing) {
-      try { existing.push(await LocationProfile.create({ user_id: userId, location })); }
-      catch (e) { if (e.code !== 11000) throw e; }
+      try {
+        existing.push(await LocationProfile.create({
+          user_id: userId,
+          location,
+          label: LOCATION_LABELS[location] || location,
+          // Seed the historical anchor. The partial unique index guarantees at most one, so a
+          // race here surfaces as a duplicate-key error rather than two filling sites.
+          is_filling_location: location === 'AT_PLANT_CHANDISAR' && !existing.some(x => x.is_filling_location)
+        }));
+      } catch (e) { if (e.code !== 11000) throw e; }
     }
   }
   const user = await User.findById(userId).select('active_location');
-  const profiles = LOCATIONS.map(l => {
+  // Ordered by the registry, not by the static array — a location added later still appears.
+  const { codes, labels } = await locationService.getUserLocations(userId);
+  const profiles = codes.map(l => {
     const p = existing.find(x => x.location === l) || {};
     return {
       location: l,
+      label: labels[l] || l,
+      is_filling_location: !!p.is_filling_location,
       manager_name: p.manager_name || '',
       contact_number: p.contact_number || '',
       challan_prefix: p.challan_prefix || ''
     };
   });
-  return { active_location: (user && user.active_location) || 'AT_PLANT_CHANDISAR', profiles };
+  return {
+    active_location: (user && user.active_location) || (codes[0] || 'AT_PLANT_CHANDISAR'),
+    profiles
+  };
 }
 
-// Only manager/contact/prefix are editable — `location` identifies the record and is immutable.
-async function updateLocationProfile(userId, location, { manager_name, contact_number, challan_prefix }) {
-  if (!LOCATIONS.includes(location)) throw new HttpError(400, 'Unknown location');
+// ─── Phase GEN-B2: reassigning which location fills ───
+//
+// Moving the filling flag is TWO writes (clear the old, set the new) and the partial unique index
+// forbids the intermediate state where both are true. So the order is forced: clear first, then
+// set. A crash between them leaves the user with ZERO filling locations — degraded (transfers go
+// unclassified) but never corrupt, and self-healing on retry.
+//
+// A transaction removes even that window, so we use one wherever the deployment supports it.
+// Production Atlas is a replica set and does. A plain local mongod is standalone and does NOT —
+// so this falls back rather than making the feature untestable on a developer machine.
+const TX_UNSUPPORTED = /does not support (retryable writes|transactions)|Transaction numbers are only allowed|IllegalOperation|replica set member or mongos/i;
+
+async function applyFillingSwap(userId, location, session) {
+  const opts = session ? { session } : {};
+  // Clear first: the unique index would reject a moment where two rows are flagged.
+  await LocationProfile.updateMany(
+    { user_id: userId, is_filling_location: true, location: { $ne: location } },
+    { $set: { is_filling_location: false } }, opts
+  );
+  await LocationProfile.updateOne(
+    { user_id: userId, location },
+    { $set: { is_filling_location: true } }, opts
+  );
+}
+
+async function setFillingLocation(userId, location) {
+  const current = (await locationService.getUserLocations(userId)).fillingLocationCode;
+  if (current === location) return;                       // already the filling site — nothing to do
+
+  let session;
+  try {
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => { await applyFillingSwap(userId, location, session); });
+    return;
+  } catch (e) {
+    if (!TX_UNSUPPORTED.test(e.message || '')) throw e;
+    // Standalone mongod (local dev): fall back to the ordered pair of writes described above.
+    console.warn('setFillingLocation: transactions unavailable on this deployment — ' +
+                 'falling back to ordered writes (clear old, then set new).');
+  } finally {
+    if (session) session.endSession();
+  }
+
+  try {
+    await applyFillingSwap(userId, location);
+  } catch (e) {
+    // Best effort: if setting the new one failed we may have left nobody flagged. Put the
+    // previous one back so the account is never worse off than before the attempt.
+    if (current) {
+      try {
+        await LocationProfile.updateOne({ user_id: userId, location: current }, { $set: { is_filling_location: true } });
+      } catch { /* leave it to the user to re-pick; zero filling locations is a legal state */ }
+    }
+    throw e;
+  }
+}
+
+// Turn a human label into a permanent, unique code for this user. The code is what every Cylinder,
+// Bill and CylinderHistory row will reference forever (R83), so it is derived once at creation and
+// never regenerated when the label is later edited.
+async function generateLocationCode(userId, label) {
+  const slug = String(label || '').toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'LOCATION';
+  const base = `AT_${slug}`.slice(0, 60);
+  const { codes } = await locationService.getUserLocations(userId);
+  const taken = new Set(codes);
+  if (!taken.has(base)) return base;
+  for (let n = 2; n < 1000; n++) {
+    const candidate = `${base}_${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  throw new HttpError(400, 'Could not generate a unique code for that location name');
+}
+
+// Only manager/contact/prefix/label/filling-flag are editable — `location` identifies the record
+// and is immutable (R83).
+async function updateLocationProfile(userId, location, { manager_name, contact_number, challan_prefix, label, is_filling_location }) {
+  // Validated against THIS user's registry, which is what replaces the schema enum removed in
+  // GEN-B1. Seeding runs first so a brand-new account still resolves its three sites.
+  await getLocationProfiles(userId);
+  if (!(await locationService.isValidLocation(userId, location))) throw new HttpError(400, 'Unknown location');
+
   const update = {};
   if (manager_name !== undefined) update.manager_name = String(manager_name).trim();
   if (contact_number !== undefined) update.contact_number = String(contact_number).trim();
   if (challan_prefix !== undefined) update.challan_prefix = String(challan_prefix).trim();
+  if (label !== undefined) {
+    const l = String(label).trim();
+    if (!l) throw new HttpError(400, 'Location name cannot be blank');
+    update.label = l;
+  }
+
+  // The filling flag is NOT a plain field write — moving it has to clear the previous holder in
+  // the same breath, or the unique index rejects the update. Done before the $set below so a
+  // failed swap aborts the whole save.
+  if (is_filling_location === true) {
+    await setFillingLocation(userId, location);
+  } else if (is_filling_location === false) {
+    // Explicitly standing down: allowed, and leaves the user with no filling location (R85).
+    await LocationProfile.updateOne({ user_id: userId, location }, { $set: { is_filling_location: false } });
+  }
 
   const profile = await LocationProfile.findOneAndUpdate(
     { user_id: userId, location },
-    { $set: update, $setOnInsert: { user_id: userId, location } },
+    {
+      $set: update,
+      // `label` is required, so an upsert must always carry one — otherwise a race that inserts
+      // here would fail validation.
+      $setOnInsert: { user_id: userId, location, label: LOCATION_LABELS[location] || location }
+    },
     { new: true, upsert: true, setDefaultsOnInsert: true }
   );
   return {
     message: 'Location profile saved',
     profile: {
       location: profile.location,
+      label: profile.label || location,
+      is_filling_location: !!profile.is_filling_location,
       manager_name: profile.manager_name || '',
       contact_number: profile.contact_number || '',
       challan_prefix: profile.challan_prefix || ''
@@ -103,8 +223,16 @@ async function updateLocationProfile(userId, location, { manager_name, contact_n
 // Phase 20: one shared Save commits all three location profiles together.
 async function updateLocationProfilesBatch(userId, profiles) {
   if (!Array.isArray(profiles) || profiles.length === 0) throw new HttpError(400, 'A profiles array is required');
+  await getLocationProfiles(userId);   // seed first so a fresh account validates
   for (const p of profiles) {
-    if (!p || !LOCATIONS.includes(p.location)) throw new HttpError(400, `Unknown location "${p && p.location}"`);
+    if (!p || !(await locationService.isValidLocation(userId, p.location))) {
+      throw new HttpError(400, `Unknown location "${p && p.location}"`);
+    }
+  }
+  // Caught here rather than letting the per-location loop below apply them in turn, where the
+  // last one would silently win.
+  if (profiles.filter(p => p.is_filling_location === true).length > 1) {
+    throw new HttpError(400, 'Only one location can be the filling location');
   }
   for (const p of profiles) {
     await updateLocationProfile(userId, p.location, p);
@@ -112,9 +240,60 @@ async function updateLocationProfilesBatch(userId, profiles) {
   return { message: 'All location profiles saved', saved: profiles.map(p => p.location) };
 }
 
+// Phase GEN-B2: add a site. The code is generated once and permanent; everything else is editable
+// afterwards. Creating a location changes nothing about existing cylinders, bills or reports — it
+// only makes a new value selectable.
+async function createLocationProfile(userId, { label, is_filling_location, manager_name, contact_number, challan_prefix }) {
+  const name = String(label || '').trim();
+  if (!name) throw new HttpError(400, 'A location name is required');
+
+  await getLocationProfiles(userId);   // make sure the seed sites exist before we check for clashes
+
+  const { codes, labels } = await locationService.getUserLocations(userId);
+  if (codes.some(c => String(labels[c] || '').trim().toLowerCase() === name.toLowerCase())) {
+    throw new HttpError(400, `You already have a location called "${name}"`);
+  }
+
+  const code = await generateLocationCode(userId, name);
+
+  let profile;
+  try {
+    profile = await LocationProfile.create({
+      user_id: userId,
+      location: code,
+      label: name,
+      is_filling_location: false,          // set via the swap below, never inline
+      manager_name: String(manager_name || '').trim(),
+      contact_number: String(contact_number || '').trim(),
+      challan_prefix: String(challan_prefix || '').trim()
+    });
+  } catch (e) {
+    if (e.code === 11000) throw new HttpError(400, 'That location already exists');
+    throw e;
+  }
+
+  if (is_filling_location === true) {
+    await setFillingLocation(userId, code);
+    profile.is_filling_location = true;
+  }
+
+  return {
+    message: `Location "${name}" added`,
+    profile: {
+      location: profile.location,
+      label: profile.label,
+      is_filling_location: !!profile.is_filling_location,
+      manager_name: profile.manager_name || '',
+      contact_number: profile.contact_number || '',
+      challan_prefix: profile.challan_prefix || ''
+    }
+  };
+}
+
 // Switching only changes UI defaults — it never touches Bill/Cylinder/Customer data.
 async function setActiveLocation(userId, location) {
-  if (!LOCATIONS.includes(location)) throw new HttpError(400, 'Unknown location');
+  await getLocationProfiles(userId);   // seed first so a fresh account validates
+  if (!(await locationService.isValidLocation(userId, location))) throw new HttpError(400, 'Unknown location');
   await User.updateOne({ _id: userId }, { active_location: location });
   return { message: 'Active location updated', active_location: location };
 }
@@ -490,6 +669,7 @@ module.exports = {
   getBusinessProfile,
   updateBusinessProfile,
   getLocationProfiles,
+  createLocationProfile,
   updateLocationProfile,
   updateLocationProfilesBatch,
   setActiveLocation,

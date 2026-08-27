@@ -17,7 +17,6 @@ async function fillingVendorIds(userId) {
 // keeps a transfer that a cylinder was added to during an edit authoritative over receives that were
 // entered before that edit — the vehicle-collects-empties-en-route case.
 
-const CH = 'AT_PLANT_CHANDISAR';
 
 // IST calendar day of an instant — the business day an entry belongs to.
 const istDay = (d) => new Date(new Date(d).getTime() + 330 * 60000).toISOString().slice(0, 10);
@@ -148,4 +147,4 @@ async function stateAsOf(userId, serial, asOf, excludeBillId) {
   return { state, holder, priorRealBills: count };
 }
 
-module.exports = { lineEffTime, replaySerial, recomputeCylinderState, stateAsOf, fillingVendorIds, CH };
+module.exports = { lineEffTime, replaySerial, recomputeCylinderState, stateAsOf, fillingVendorIds };

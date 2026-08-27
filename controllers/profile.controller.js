@@ -24,6 +24,17 @@ exports.updateLocationProfilesBatch = asyncHandler(async (req, res) => {
   res.json(result);
 });
 
+// Phase GEN-B2: add a location. Step-up gated and audit-logged like every other profile mutation.
+exports.createLocationProfile = asyncHandler(async (req, res) => {
+  const result = await profileService.createLocationProfile(req.user.id, req.body);
+  await require('../services/audit.service').record({
+    userId: req.user.id, action: 'PROFILE_SAVE',
+    target: `Location Profile created — ${result.profile.label} (${result.profile.location})`,
+    stepUp: req.stepUp
+  });
+  res.status(201).json(result);
+});
+
 // Phase 26: step 1 — send a code to the new address. Persists nothing.
 exports.requestEmailChange = asyncHandler(async (req, res) => {
   res.json(await profileService.requestEmailChange(req.user.id, req.body));

@@ -6,7 +6,7 @@ const Cylinder = require('../models/Cylinder');
 const LocationProfile = require('../models/LocationProfile');
 const HttpError = require('../utils/HttpError');
 const { computeHoldings } = require('./holdings.service');
-const { LOCATIONS, LOCATION_LABELS } = require('../config/locations');
+const locationService = require('./location.service');
 const { getPcStock } = require('./pcStock.service');
 const toOid = (id) => new mongoose.Types.ObjectId(id);
 
@@ -257,7 +257,9 @@ async function getDSR(uid, { date, location }) {
   const start = new Date(day); start.setHours(0, 0, 0, 0);
   const end = new Date(day); end.setHours(23, 59, 59, 999);
 
-  const loc = LOCATIONS.includes(location) ? location : null;
+  // GEN-B1: validity comes from the user's registry, not a static array.
+  const { codes, labels, fillingLocationCode } = await locationService.getUserLocations(uid);
+  const loc = codes.includes(location) ? location : null;
 
   // Phase 24: a site's DSR must also show stock it sent out to the other sites that day.
   // Internal transfers carry from_location/to_location instead of location, so a plain
@@ -291,9 +293,13 @@ async function getDSR(uid, { date, location }) {
   const rows = [];
   const totals = { filled_qty: 0, empty_qty: 0, pc_in: 0, pc_out: 0, amount: 0 };
   const transferTotals = { filled_qty: 0, empty_qty: 0, pc_in: 0, pc_out: 0, amount: 0 };
-  // Phase 32: direct Palanpur↔Chhapi transfers (neither endpoint Chandisar) don't fit the
-  // Chandisar-anchored fill/empty rule — collect them so the caller can flag them for a decision.
-  const CHANDISAR = 'AT_PLANT_CHANDISAR';
+  // Phase 32: a transfer with neither endpoint at the filling site doesn't fit the
+  // filling-anchored fill/empty rule — collect them so the caller can flag them for a decision.
+  // GEN-B1: the anchor is whichever location the user marked as filling, not a hardcoded site.
+  // `isF` is null-safe on purpose: a user with NO filling location makes every transfer
+  // unclassified, which is exactly the existing Palanpur↔Chhapi path.
+  const FILLING = fillingLocationCode;
+  const isF = (x) => !!FILLING && x === FILLING;
   const flaggedTransfers = [];
   for (const b of bills) {
     const isTransfer = b.transaction_category === 'INTERNAL_TRANSFER';
@@ -301,9 +307,9 @@ async function getDSR(uid, { date, location }) {
     // NOT to which DSR is being viewed. A transfer FROM Chandisar is filled stock going out to a
     // sub-office (→ Filled / PC Out); a transfer TO Chandisar is empties coming back for refill
     // (→ Empty / PC In). A direct Palanpur↔Chhapi transfer fits neither and is left unclassified.
-    const fromChandisar = isTransfer && b.from_location === CHANDISAR;
-    const toChandisar = isTransfer && b.to_location === CHANDISAR;
-    const transferUnclassified = isTransfer && !fromChandisar && !toChandisar;
+    const fromFilling = isTransfer && isF(b.from_location);
+    const toFilling = isTransfer && isF(b.to_location);
+    const transferUnclassified = isTransfer && !fromFilling && !toFilling;
     if (transferUnclassified) {
       flaggedTransfers.push({
         bill_id: String(b._id), bill_number: b.bill_number,
@@ -323,13 +329,13 @@ async function getDSR(uid, { date, location }) {
           location: isTransfer ? (loc || b.from_location) : b.location,
           // Phase 31: name both endpoints explicitly, e.g. "Internal Transfer: Chandisar Plant → Palanpur Office".
           customer_name: isTransfer
-            ? `Internal Transfer: ${LOCATION_LABELS[b.from_location] || b.from_location} → ${LOCATION_LABELS[b.to_location] || b.to_location}`
+            ? `Internal Transfer: ${labels[b.from_location] || b.from_location} → ${labels[b.to_location] || b.to_location}`
             : (b.customer_id ? b.customer_id.company_name : ''),
           is_transfer: isTransfer,
           from_location: isTransfer ? b.from_location : undefined,
           to_location: isTransfer ? b.to_location : undefined,
           // OUT = filled leaving Chandisar; IN = empties returning to Chandisar; REVIEW = direct sub-office move.
-          transfer_direction: isTransfer ? (fromChandisar ? 'OUT' : toChandisar ? 'IN' : 'REVIEW') : undefined,
+          transfer_direction: isTransfer ? (fromFilling ? 'OUT' : toFilling ? 'IN' : 'REVIEW') : undefined,
           needs_review: !!transferUnclassified,
           vehicle_number: b.vehicle_number || '', // Phase 27
           gas_type: gas, size,
@@ -343,10 +349,10 @@ async function getDSR(uid, { date, location }) {
         // Phase 32 — Chandisar-anchored (see above). Only Chandisar fills, so its outgoing
         // transfers are always Filled/PC Out and its incoming ones always Empty/PC In.
         const pcMoved = li.personalCylindersIn || 0; // transfer PC lines store qty here
-        if (fromChandisar) {
+        if (fromFilling) {
           if (li.serial_number) r.filled_qty += li.quantity || 0;
           r.pc_out += pcMoved;
-        } else if (toChandisar) {
+        } else if (toFilling) {
           if (li.serial_number) r.empty_qty += li.quantity || 0;
           r.pc_in += pcMoved;
         }
@@ -382,7 +388,7 @@ async function getDSR(uid, { date, location }) {
   return {
     date: start,
     location: loc || 'ALL',
-    location_label: loc ? LOCATION_LABELS[loc] : 'All Locations',
+    location_label: loc ? (labels[loc] || loc) : 'All Locations',
     reporting_person,
     rows,
     totals,
@@ -418,9 +424,13 @@ const stockCapKey = (cap) => String(cap || '').trim() || '7 m3';
 // (Sub-offices never fill, so their Filled "In" is only transfers-in; direct sub-office↔sub-office
 //  transfers don't fit the model and are ignored here — the DSR flags them for a decision.)
 async function getStockSummary(uid, { date, location }) {
-  if (!LOCATIONS.includes(location)) throw new HttpError(400, 'A valid location is required');
-  const CHANDISAR = 'AT_PLANT_CHANDISAR';
-  const isChandisar = location === CHANDISAR;
+  // GEN-B1: registry-driven, resolved independently of the DSR above — these two reports stay
+  // separate implementations by design and must not share calculation logic.
+  const { codes, labels, fillingLocationCode } = await locationService.getUserLocations(uid);
+  if (!codes.includes(location)) throw new HttpError(400, 'A valid location is required');
+  const FILLING = fillingLocationCode;
+  const isF = (x) => !!FILLING && x === FILLING;   // null-safe: no filling site => never matches
+  const isFillingLoc = isF(location);
   const FillingLogEntry = require('../models/FillingLogEntry');
 
   const day = date ? new Date(date) : new Date();
@@ -472,8 +482,8 @@ async function getStockSummary(uid, { date, location }) {
     for (const li of b.line_items) {
       if (!li.serial_number) continue;
       if (b.transaction_category === 'INTERNAL_TRANSFER') {
-        if (b.to_location === CHANDISAR) bump(li.serial_number, b.bill_date, true);        // empties back to plant
-        else if (b.from_location === CHANDISAR) bump(li.serial_number, b.bill_date, false); // filled sent out
+        if (isF(b.to_location)) bump(li.serial_number, b.bill_date, true);        // empties back to the filling site
+        else if (isF(b.from_location)) bump(li.serial_number, b.bill_date, false); // filled sent out
         // sub-office↔sub-office: leave state unchanged
       } else {
         bump(li.serial_number, b.bill_date, li.direction === 'RECEIVED'); // returned empty vs given filled
@@ -501,19 +511,19 @@ async function getStockSummary(uid, { date, location }) {
     if (isTransfer) {
       const from = b.from_location, to = b.to_location;
       // Only transfers with a Chandisar endpoint are classified (sub-office↔sub-office ignored).
-      const touchesHereChandisar = isChandisar && (from === CHANDISAR || to === CHANDISAR);
-      const touchesHereSub = !isChandisar && ((from === location && to === CHANDISAR) || (to === location && from === CHANDISAR));
-      if (!touchesHereChandisar && !touchesHereSub) continue;
+      const touchesHereFilling = isFillingLoc && (isF(from) || isF(to));
+      const touchesHereSub = !isFillingLoc && ((from === location && isF(to)) || (to === location && isF(from)));
+      if (!touchesHereFilling && !touchesHereSub) continue;
       for (const li of b.line_items) {
         if (!li.serial_number) continue; // serialized only
         const qty = li.quantity || 0; if (!qty) continue;
         const gas = stockGasKey(li.gas_type_name), cap = stockCapKey(li.size_label);
-        if (isChandisar) {
-          if (from === CHANDISAR) addF(gas, cap, 'out' + bkt, qty);       // filled out to a sub-office
-          else if (to === CHANDISAR) addE(gas, cap, 'in' + bkt, qty);     // empties back for refill
+        if (isFillingLoc) {
+          if (isF(from)) addF(gas, cap, 'out' + bkt, qty);       // filled out to a sub-office
+          else if (isF(to)) addE(gas, cap, 'in' + bkt, qty);     // empties back for refill
         } else {
-          if (to === location && from === CHANDISAR) addF(gas, cap, 'in' + bkt, qty);   // filled arrives
-          else if (from === location && to === CHANDISAR) addE(gas, cap, 'out' + bkt, qty); // empties sent to Chandisar
+          if (to === location && isF(from)) addF(gas, cap, 'in' + bkt, qty);   // filled arrives
+          else if (from === location && isF(to)) addE(gas, cap, 'out' + bkt, qty); // empties sent for refill
         }
       }
     } else {
@@ -524,10 +534,10 @@ async function getStockSummary(uid, { date, location }) {
         const qty = li.quantity || 0; if (!qty) continue;
         const gas = stockGasKey(li.gas_type_name), cap = stockCapKey(li.size_label);
         if (li.direction === 'GIVEN') {
-          if (isChandisar && isVendor) addE(gas, cap, 'out' + bkt, qty);  // empties sent to filling vendor
+          if (isFillingLoc && isVendor) addE(gas, cap, 'out' + bkt, qty);  // empties sent to filling vendor
           else addF(gas, cap, 'out' + bkt, qty);                          // filled given to customer
         } else if (li.direction === 'RECEIVED') {
-          if (isChandisar && isVendor) addF(gas, cap, 'in' + bkt, qty);   // vendor returns filled
+          if (isFillingLoc && isVendor) addF(gas, cap, 'in' + bkt, qty);   // vendor returns filled
           else addE(gas, cap, 'in' + bkt, qty);                           // empty back from customer
         }
       }
@@ -535,7 +545,7 @@ async function getStockSummary(uid, { date, location }) {
   }
 
   // ── Filling log (Chandisar only): each fill adds to Filled In and removes from Empty (Out). ──
-  if (isChandisar) {
+  if (isFillingLoc) {
     for (const f of fills) {
       const bkt = f.date === dayStr ? 'On' : (f.date > dayStr ? 'After' : null);
       if (!bkt) continue;
@@ -566,10 +576,12 @@ async function getStockSummary(uid, { date, location }) {
   return {
     date: start,
     location,
-    location_label: LOCATION_LABELS[location],
+    location_label: labels[location] || location,
     // Sub-offices never fill — their Filled "In" is purely transfers received from Chandisar.
-    filled_add_label: isChandisar ? 'Filled Today' : 'Add (Transfers In from Chandisar)',
-    empty_issue_label: isChandisar ? 'Issue (Filled Today + Sent to Vendors)' : 'Issue (Transfers Out to Chandisar)',
+    // GEN-B1: these headers named the filling site in prose. They now follow its label, and fall
+    // back to a generic phrase when the user has no filling location configured.
+    filled_add_label: isFillingLoc ? 'Filled Today' : `Add (Transfers In from ${FILLING ? (labels[FILLING] || FILLING) : 'the filling location'})`,
+    empty_issue_label: isFillingLoc ? 'Issue (Filled Today + Sent to Vendors)' : `Issue (Transfers Out to ${FILLING ? (labels[FILLING] || FILLING) : 'the filling location'})`,
     rows
   };
 }
