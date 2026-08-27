@@ -24,6 +24,14 @@ describe('Cylinder — giving validation', () => {
       password: 'Test1234!'
     });
     userId = user._id;
+    // GEN-C: a new account is seeded with ONE generic site, not Guru's three. This suite uses the
+    // legacy codes, so it creates what it needs explicitly rather than leaning on a default.
+    const LocationProfile = require('../models/LocationProfile');
+    await LocationProfile.create([
+      { user_id: userId, location: 'AT_PLANT_CHANDISAR', label: 'Chandisar Plant', is_filling_location: true },
+      { user_id: userId, location: 'AT_PALANPUR_OFFICE', label: 'Palanpur Office' },
+      { user_id: userId, location: 'AT_CHHAPI_OFFICE', label: 'Chhapi Office' }
+    ]);
   });
 
   test('creating a cylinder without under_maintenance defaults to false', async () => {

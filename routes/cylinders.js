@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
+const { stepUpGate } = require('../middleware/stepUp');
 const validate = require('../middleware/validate');
 const V = require('../validators/schemas');
 const ctrl = require('../controllers/cylinders.controller');
@@ -13,6 +14,11 @@ router.get('/aging-report', ctrl.getAgingReport);
 router.get('/', ctrl.listCylinders);
 router.get('/in-rotation', ctrl.listInRotation);
 router.get('/:id/history', ctrl.getCylinderHistory);
+// GEN-C: the FULL history. The default view above stays open to any logged-in session and still
+// returns 15 rows; everything BEYOND those 15 is step-up gated. The step-up token is valid 10
+// minutes and reusable, so one approval covers a whole "Load next 20" browsing session — the
+// caller is not re-prompted per page. MUST stay above '/:id' or it is captured as an :id param.
+router.get('/:id/history/full', stepUpGate('Viewing the full history'), ctrl.getCylinderHistoryPage);
 router.get('/:id', ctrl.getCylinder);
 router.post('/', validate(V.cylinderCreate), ctrl.createCylinder);
 router.post('/import', validate(V.importRows), ctrl.importCylinders);

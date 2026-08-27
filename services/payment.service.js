@@ -1,17 +1,41 @@
 const Payment = require('../models/Payment');
 const Bill = require('../models/Bill');
 const HttpError = require('../utils/HttpError');
+const accountNumbering = require('./accountNumbering.service');
 
-// receipt_number is globally unique, so the next number must come from the numeric max —
-// not the newest-by-createdAt document, whose number can lag behind (e.g. backdated entries).
-async function generateReceiptNumber() {
+// The next number comes from the numeric MAX, not the newest-by-createdAt document — a backdated
+// entry can carry a number lower than the latest one created.
+//
+// GEN-C: scoped to one account, and to one financial year when that account has opted into
+// restarting its series each 1 April. It used to aggregate across EVERY payment in the database
+// with no account filter at all, which would have handed a second CylinderPro client a receipt
+// series continuing from the first client's.
+async function generateReceiptNumber(userId, date = new Date()) {
+  const { accountCode, financialYear, resets } = await accountNumbering.getContext(userId, date);
+
+  const match = { user_id: userId, receipt_number: /^RCP-\d+$/ };
+  // With reset OFF the series is continuous for the life of the account, so the max is taken
+  // across every year. With it ON, only this financial year's receipts count.
+  if (resets) match.financial_year = financialYear;
+
   const result = await Payment.aggregate([
-    { $match: { receipt_number: /^RCP-\d+$/ } },
+    { $match: match },
     { $project: { num: { $toInt: { $arrayElemAt: [{ $split: ['$receipt_number', '-'] }, 1] } } } },
     { $group: { _id: null, max: { $max: '$num' } } }
   ]);
-  const max = (result.length && result[0].max) || 0;
-  return `RCP-${String(max + 1).padStart(4, '0')}`;
+  let n = ((result.length && result[0].max) || 0) + 1;
+
+  // The max may sit below a gap that a backdated receipt already occupies in THIS year, so step
+  // past anything taken rather than trusting the max alone.
+  for (let guard = 0; guard < 100000; guard++) {
+    const candidate = `RCP-${String(n).padStart(4, '0')}`;
+    const taken = await Payment.exists({
+      account_code: accountCode, financial_year: financialYear, receipt_number: candidate
+    });
+    if (!taken) return candidate;
+    n++;
+  }
+  return `RCP-${String(n).padStart(4, '0')}`;
 }
 
 async function createPayment(userId, body) {
@@ -35,7 +59,7 @@ async function createPayment(userId, body) {
     throw new HttpError(400, 'Cheque number is required for cheque payments');
   }
 
-  const receiptNumber = await generateReceiptNumber();
+  const receiptNumber = await generateReceiptNumber(userId, date);
 
   // Challan is never entered manually on payments (Phase 5) — it is derived from the linked
   // bill when there is one, purely for receipt display.

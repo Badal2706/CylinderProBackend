@@ -25,7 +25,15 @@ const businessProfileSchema = new mongoose.Schema({
   // scales on its own; letterhead text size is unaffected.
   logo_scale: { type: Number, default: 100 },
   // Optional logo stored as a data URL (data:image/png;base64,...). Kept small.
-  logo: { type: String, default: '' }
+  logo: { type: String, default: '' },
+  // ─── Phase GEN-C: financial-year numbering reset ───
+  // true  = bill and receipt series restart at 1A001 / RCP-0001 every 1 April.
+  // false = one continuous series for the life of the account (the default, and the
+  //         pre-GEN-C behaviour).
+  // LOCKS PERMANENTLY once the account has lived through its first 1 April, measured from the
+  // account's own activation date — see numbering.service.isFyChoiceLocked. Locking is enforced
+  // in profile.service, not here, so the migration can still write it.
+  fy_reset_numbering: { type: Boolean, default: false }
 }, { timestamps: true });
 
 module.exports = mongoose.model('BusinessProfile', businessProfileSchema);

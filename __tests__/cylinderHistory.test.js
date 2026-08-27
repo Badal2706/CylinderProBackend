@@ -102,23 +102,91 @@ describe('Cylinder history (Phase 33)', () => {
     expect(e.to_state).toBe('AT_CUSTOMER');
   });
 
-  test('rolling cap keeps only the 15 most recent entries', async () => {
+  // GEN-C inverted this test. It used to assert the rolling cap DELETED everything past the newest
+  // 15. Nothing is ever deleted now — the 15 is only how many the default view shows.
+  // C2 already carries entries from the tests above, so the totals are derived, not hardcoded.
+  let c2Total = 0;
+
+  test('nothing is deleted past 15 — every entry is kept', async () => {
+    const before = await CylinderHistory.countDocuments({ cylinder_id: C2 });
     const now = Date.now();
     const bulk = Array.from({ length: 20 }, (_, i) => ({
       user_id: uid, cylinder_id: C2, rotational_number: 'H-2', event_type: 'FILLED',
       description: `bulk #${i}`, event_at: new Date(now + i * 1000)
     }));
     await histSvc.logEvents(bulk);
+    c2Total = before + 20;
+
     const all = await CylinderHistory.find({ cylinder_id: C2 }).sort({ event_at: -1, createdAt: -1, _id: -1 }).lean();
-    expect(all.length).toBe(15);
+    expect(all.length).toBe(c2Total);
+    expect(c2Total).toBeGreaterThan(15);           // the cap would have had something to destroy
     expect(all[0].description).toBe('bulk #19');
-    expect(all.some(x => x.description === 'bulk #0')).toBe(false);
+    // The row the old cap would have destroyed first is still here. This is the whole point.
+    expect(all.some(x => x.description === 'bulk #0')).toBe(true);
   });
 
-  test('getHistory returns a header plus capped, newest-first events', async () => {
+  test('the default view still shows only the newest 15, and reports the true total', async () => {
+    const read = await histSvc.getHistory(uid, String(C2));
+    expect(read.history.length).toBe(15);          // unchanged for every existing caller
+    expect(read.total_count).toBe(c2Total);        // but the count is honest about what exists
+    expect(read.history[0].description).toBe('bulk #19');
+  });
+
+  test('getHistory returns a header plus newest-first events', async () => {
     const read = await histSvc.getHistory(uid, String(C1));
     expect(read.cylinder.rotational_number).toBe('H-1');
     expect(read.history.length).toBeGreaterThan(0);
     expect(read.history.length).toBeLessThanOrEqual(15);
+    expect(typeof read.total_count).toBe('number');
+  });
+
+  describe('GEN-C paginated full view', () => {
+    test('pages of 20 walk the whole log without gaps or repeats', async () => {
+      const seen = [];
+      let skip = 0;
+      for (let guard = 0; guard < 50; guard++) {
+        const page = await histSvc.getHistoryPage(uid, String(C2), { skip, limit: 7 });
+        expect(page.total).toBe(c2Total);
+        seen.push(...page.rows.map(r => r.id));
+        if (!page.hasMore) break;
+        skip += page.rows.length;
+      }
+      expect(seen.length).toBe(c2Total);
+      // No id appears twice — proof the sort is total and paging is stable.
+      expect(new Set(seen).size).toBe(c2Total);
+    });
+
+    test('the first page matches the default view row for row', async () => {
+      const dflt = await histSvc.getHistory(uid, String(C2));
+      const page = await histSvc.getHistoryPage(uid, String(C2), { skip: 0, limit: 15 });
+      expect(page.rows.map(r => r.id)).toEqual(dflt.history.map(r => r.id));
+    });
+
+    test('hasMore is false on the last page', async () => {
+      const page = await histSvc.getHistoryPage(uid, String(C2), { skip: 15, limit: 100 });
+      expect(page.rows.length).toBe(c2Total - 15);
+      expect(page.hasMore).toBe(false);
+
+      // Past the end: empty, and still not claiming there is more.
+      const past = await histSvc.getHistoryPage(uid, String(C2), { skip: c2Total + 10, limit: 20 });
+      expect(past.rows.length).toBe(0);
+      expect(past.hasMore).toBe(false);
+    });
+
+    test('a limit beyond the ceiling is clamped, and junk input falls back to defaults', async () => {
+      const big = await histSvc.getHistoryPage(uid, String(C2), { skip: 0, limit: 9999 });
+      expect(big.limit).toBe(100);
+      const junk = await histSvc.getHistoryPage(uid, String(C2), { skip: 'abc', limit: 'xyz' });
+      expect(junk.skip).toBe(0);
+      expect(junk.limit).toBe(20);
+      const neg = await histSvc.getHistoryPage(uid, String(C2), { skip: -5, limit: -1 });
+      expect(neg.skip).toBe(0);
+      expect(neg.limit).toBe(20);
+    });
+
+    test('another user cannot page a cylinder that is not theirs', async () => {
+      const other = await User.create({ name: 'Other', email: 'other-histpage@test.com', password: 'Test1234!' });
+      await expect(histSvc.getHistoryPage(other._id, String(C2), {})).rejects.toThrow(/not found/i);
+    });
   });
 });

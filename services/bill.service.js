@@ -9,6 +9,7 @@ const { computeHoldings } = require('./holdings.service');
 const { recomputeLocationPcStock } = require('./pcStock.service');
 const { recomputeCylinderState, stateAsOf } = require('./cylinderState.service');
 const audit = require('./audit.service');
+const accountNumbering = require('./accountNumbering.service');
 
 // Edit/Delete window (Phase 5): bills are mutable for 3 days from their CREATION timestamp
 // (createdAt — not the transaction date typed on the bill). bill_number stays editable forever.
@@ -141,13 +142,20 @@ function billNumberToSeq(str) {
 // PEEK the next default without consuming it (prefill on the form — a suggestion the user
 // may edit or discard, so it must be idempotent). Skips any series value already taken by a
 // real or draft bill so the suggestion never collides with a manually-entered future number.
-async function peekNextBillNumber() {
+//
+// GEN-C: scoped to ONE account and, when that account has opted into financial-year reset, to
+// one financial year. Both the counter row and the collision check are scoped — an unscoped
+// check would refuse 1A001 in the new year merely because last year's 1A001 exists.
+async function peekNextBillNumber(userId, date = new Date()) {
   const Counter = require('../models/Counter');
-  const c = await Counter.findOne({ key: COUNTER_KEY });
+  const { accountCode, financialYear, counterFy } = await accountNumbering.getContext(userId, date);
+  const c = await Counter.findOne({ user_id: userId, key: COUNTER_KEY, financial_year: counterFy });
   let n = ((c && c.seq) || 0) + 1;
   for (let guard = 0; guard < 100000; guard++) {
     const candidate = seqToBillNumber(n);
-    const clash = await Bill.exists({ bill_number: candidate });
+    const clash = await Bill.exists({
+      account_code: accountCode, financial_year: financialYear, bill_number: candidate
+    });
     if (!clash) return candidate;
     n++;
   }
@@ -157,17 +165,40 @@ async function peekNextBillNumber() {
 // Advance the persistent counter past a just-used bill number (keeps it monotonic whether the
 // user accepted the prefilled suggestion, typed a different in-series number, or a draft
 // reserved one). Out-of-series numbers (BILL-####, GST-####, …) leave the counter untouched.
-async function advanceCounterPast(billNumber) {
+async function advanceCounterPast(userId, billNumber, date = new Date()) {
   const seq = billNumberToSeq(billNumber);
   if (seq == null) return;
   const Counter = require('../models/Counter');
-  await Counter.updateOne({ key: COUNTER_KEY }, { $max: { seq } }, { upsert: true });
+  const { counterFy } = await accountNumbering.getContext(userId, date);
+  await Counter.updateOne(
+    { user_id: userId, key: COUNTER_KEY, financial_year: counterFy },
+    { $max: { seq } },
+    { upsert: true }
+  );
 }
 
 // Back-compat alias: callers that just want "the next default number" (drafts, transfer
 // fallback) peek the series. Consumption is finalized via advanceCounterPast after save.
-async function generateBillNumber() {
-  return peekNextBillNumber();
+async function generateBillNumber(userId, date = new Date()) {
+  return peekNextBillNumber(userId, date);
+}
+
+// GEN-C: a bill number is unique within (account, financial year) — so every duplicate check has
+// to be scoped exactly the way the index is. An unscoped check rejects numbers that are
+// legitimately free: another CylinderPro client's, or this account's own from a previous year.
+//
+// `effectiveDate` is the date the bill WILL have, not the one it has now — editing a bill's date
+// across 1 April moves it into a different year's series, where its number may already be taken.
+async function assertBillNumberFree(userId, number, effectiveDate, { excludeId, excludeDrafts } = {}) {
+  const { accountCode, financialYear } = await accountNumbering.getContext(userId, effectiveDate);
+  const q = { account_code: accountCode, financial_year: financialYear, bill_number: number };
+  if (excludeId) q._id = { $ne: excludeId };
+  if (excludeDrafts) q.is_draft = { $ne: true };
+  const clash = await Bill.findOne(q).select('_id').lean();
+  if (clash) {
+    throw new HttpError(400,
+      `Bill number "${number}" is already used by another bill in financial year ${financialYear}.`);
+  }
 }
 
 // Business timezone. A naive datetime string ("2026-08-20T16:53" — no Z, no offset) is a LOCAL
@@ -535,7 +566,7 @@ async function createInternalTransfer(userId, body) {
 
   // Finalizing a draft reuses the draft document (and its bill_number); otherwise create fresh.
   const draftDoc = await resolveDraft(userId, body.draft_id);
-  const bill = draftDoc || new Bill({ user_id: userId, bill_number: await generateBillNumber() });
+  const bill = draftDoc || new Bill({ user_id: userId, bill_number: await generateBillNumber(userId, bill_date || new Date()) });
   Object.assign(bill, {
     is_draft: false,
     draft_payload: null,
@@ -558,7 +589,7 @@ async function createInternalTransfer(userId, body) {
 
   await bill.save(); // post-save hook moves cylinder locations
 
-  try { await advanceCounterPast(bill.bill_number); } catch (e) { /* non-fatal */ } // Phase 31
+  try { await advanceCounterPast(userId, bill.bill_number, bill.bill_date); } catch (e) { /* non-fatal */ } // Phase 31
   try { await recomputeLocationPcStock(userId); } catch (e) { /* non-fatal */ }
   // Phase 34: authoritative state = full-history replay (keeps backdated/out-of-order transfers correct).
   try { await recomputeCylinderState(userId, serials); } catch (e) { /* non-fatal */ }
@@ -830,13 +861,13 @@ async function createBill(userId, body, stepUp = null) {
   let billNumber;
   const trimmedClient = String(clientBillNumber || '').trim();
   if (trimmedClient) {
-    const clash = await Bill.findOne({ bill_number: trimmedClient, is_draft: { $ne: true } });
-    if (clash && (!draftDoc || String(clash._id) !== String(draftDoc._id))) {
-      throw new HttpError(400, `Bill number "${trimmedClient}" is already used — choose a different one.`);
-    }
+    await assertBillNumberFree(userId, trimmedClient, bill_date || new Date(), {
+      excludeId: draftDoc ? draftDoc._id : undefined,
+      excludeDrafts: true
+    });
     billNumber = trimmedClient;
   } else {
-    billNumber = draftDoc ? draftDoc.bill_number : await generateBillNumber();
+    billNumber = draftDoc ? draftDoc.bill_number : await generateBillNumber(userId, bill_date || new Date());
   }
 
   // Recompute totals server-side — never trust client `amount`. Personal cylinders RETURNED
@@ -992,7 +1023,7 @@ async function createBill(userId, body, stepUp = null) {
 
   // Advance the series counter past this number (Phase 31) — whether it was the prefilled
   // suggestion the user accepted or an in-series number they typed. No-op for custom formats.
-  try { await advanceCounterPast(billNumber); } catch (e) { /* non-fatal */ }
+  try { await advanceCounterPast(userId, billNumber, bill.bill_date); } catch (e) { /* non-fatal */ }
 
   // Record the over-limit authorization (Phase 18): who approved and how, on the bill and
   // in the audit log. updateOne so the cylinder-sync hook doesn't run a second time.
@@ -1166,8 +1197,17 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
   if (newBillNumber !== undefined) {
     if (!newBillNumber) throw new HttpError(400, 'Bill number cannot be empty');
     if (newBillNumber !== bill.bill_number) {
-      const clash = await Bill.findOne({ bill_number: newBillNumber, _id: { $ne: bill._id } });
-      if (clash) throw new HttpError(400, `Bill number "${newBillNumber}" is already used by another bill`);
+      await assertBillNumberFree(uid, newBillNumber, bill_date || bill.bill_date, { excludeId: bill._id });
+    }
+  }
+  // GEN-C: moving a bill's DATE across 1 April moves it into another year's series, where its
+  // number may already belong to a different bill. Checked even when the number itself is
+  // unchanged — silently renumbering would break the customer's copy, and allowing the
+  // duplicate would break the rule.
+  if (bill_date && newBillNumber === undefined) {
+    const movedFy = await accountNumbering.getContext(uid, bill_date);
+    if (movedFy.financialYear !== bill.financial_year) {
+      await assertBillNumberFree(uid, bill.bill_number, bill_date, { excludeId: bill._id });
     }
   }
   if (!keepLines && isLocked(bill)) {
@@ -1379,8 +1419,15 @@ async function updateBill(user, billId, body, stepUp = null) {
   if (newBillNumber !== undefined) {
     if (!newBillNumber) throw new HttpError(400, 'Bill number cannot be empty');
     if (newBillNumber !== bill.bill_number) {
-      const clash = await Bill.findOne({ bill_number: newBillNumber, _id: { $ne: bill._id } });
-      if (clash) throw new HttpError(400, `Bill number "${newBillNumber}" is already used by another bill`);
+      await assertBillNumberFree(uid, newBillNumber, bill_date || bill.bill_date, { excludeId: bill._id });
+    }
+  }
+  // GEN-C: see the matching guard in the transfer-edit path — a date edit that crosses 1 April
+  // moves this bill into a different year's number series.
+  if (bill_date && newBillNumber === undefined) {
+    const movedFy = await accountNumbering.getContext(uid, bill_date);
+    if (movedFy.financialYear !== bill.financial_year) {
+      await assertBillNumberFree(uid, bill.bill_number, bill_date, { excludeId: bill._id });
     }
   }
 
@@ -1724,7 +1771,7 @@ async function saveDraft(userId, { draft_id, location, payload }) {
   } else {
     draft = new Bill({
       user_id: userId,
-      bill_number: await generateBillNumber(),
+      bill_number: await generateBillNumber(userId),
       is_draft: true,
       draft_payload: payload,
       transaction_category: 'CUSTOMER',
@@ -1738,7 +1785,7 @@ async function saveDraft(userId, { draft_id, location, payload }) {
   await draft.save(); // hook is a no-op for drafts
 
   // A new draft reserves a real series number — advance the counter so it isn't re-issued (Phase 31).
-  if (!draft_id) { try { await advanceCounterPast(draft.bill_number); } catch (e) { /* non-fatal */ } }
+  if (!draft_id) { try { await advanceCounterPast(userId, draft.bill_number, draft.bill_date); } catch (e) { /* non-fatal */ } }
 
   return { draft_id: draft._id, bill_number: draft.bill_number, message: 'Draft saved' };
 }

@@ -36,11 +36,6 @@ exports.refresh = asyncHandler(async (req, res) => {
   res.json(await authService.refresh(req.user.id, req.user.sid || null));
 });
 
-exports.clearData = asyncHandler(async (req, res) => {
-  // Phase 21: owner-only step-up token required alongside the password (checked in the service).
-  res.json(await authService.clearData(req.user.id, req.body.password,
-    req.headers['x-step-up-token'] || req.body.step_up_token));
-});
 
 // ─── Sessions & devices (Phase 17) ───
 exports.listSessions = asyncHandler(async (req, res) => {

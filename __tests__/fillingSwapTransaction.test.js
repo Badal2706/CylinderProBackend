@@ -42,7 +42,13 @@ beforeAll(async () => {
 
   const u = await User.create({ name: 'TX', email: 'tx@test.com', password: 'Test1234!' });
   uid = u._id;
-  await profileSvc.getLocationProfiles(uid);   // seeds three sites, Chandisar flagged
+  // GEN-C: getLocationProfiles now seeds ONE generic site into an empty account, not Guru's three.
+  // These tests exercise the legacy codes, so they create them outright.
+  await LocationProfile.create([
+    { user_id: uid, location: 'AT_PLANT_CHANDISAR', label: 'Chandisar Plant', is_filling_location: true },
+    { user_id: uid, location: 'AT_PALANPUR_OFFICE', label: 'Palanpur Office' },
+    { user_id: uid, location: 'AT_CHHAPI_OFFICE', label: 'Chhapi Office' }
+  ]);
 });
 
 afterAll(async () => {

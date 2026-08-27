@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const User = require('../models/User');
 const Cylinder = require('../models/Cylinder');
+const LocationProfile = require('../models/LocationProfile');
 const Customer = require('../models/Customer');
 const GasType = require('../models/GasType');
 const CylinderSize = require('../models/CylinderSize');
@@ -23,6 +24,13 @@ describe('SWAP — same serial in both given and received (instant refill)', () 
   beforeAll(async () => {
     const user = await User.create({ name: 'Swap Test', email: 'swap@test.com', password: 'Test1234!' });
     uid = user._id;
+  // GEN-C: a new account is seeded with ONE generic site, not Guru's three. This suite uses the
+  // legacy codes, so it creates what it needs explicitly rather than leaning on a default.
+  await LocationProfile.create([
+    { user_id: uid, location: 'AT_PLANT_CHANDISAR', label: 'Chandisar Plant', is_filling_location: true },
+    { user_id: uid, location: 'AT_PALANPUR_OFFICE', label: 'Palanpur Office' },
+    { user_id: uid, location: 'AT_CHHAPI_OFFICE', label: 'Chhapi Office' }
+  ]);
     const gas = await GasType.create({ user_id: uid, gas_type_name: 'Nitrogen' });
     gasId = gas._id;
     const size = await CylinderSize.create({ user_id: uid, size_label: '7 m3' });

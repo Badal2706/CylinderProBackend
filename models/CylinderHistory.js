@@ -3,8 +3,9 @@ const mongoose = require('mongoose');
 // ─── Phase 33: per-cylinder movement/action history ───
 // One document per event that changes or concerns a cylinder's state. Purely OBSERVATIONAL —
 // nothing here ever writes back to a Cylinder's location/stock_state (that stays owned by the
-// Bill post-save hook and the manual-edit endpoint). A rolling window of the 15 most recent
-// entries per cylinder is enforced in cylinderHistory.service.logEvents (not a scheduled job).
+// Bill post-save hook and the manual-edit endpoint). GEN-C: APPEND-ONLY — the rolling 15-entry
+// window that logEvents used to enforce is gone, and no entry is ever deleted. The popup still
+// shows 15 by default; the rest is behind a step-up-gated paginated view.
 const cylinderHistorySchema = new mongoose.Schema({
   user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   cylinder_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Cylinder', required: true, index: true },
@@ -42,7 +43,7 @@ const cylinderHistorySchema = new mongoose.Schema({
   event_at: { type: Date, default: Date.now }
 }, { timestamps: true });
 
-// Newest-first per cylinder — powers both the popup read and the rolling-cap trim.
+// Newest-first per cylinder — powers the default popup read and the paginated full view.
 cylinderHistorySchema.index({ user_id: 1, cylinder_id: 1, event_at: -1, seq: -1, createdAt: -1 });
 
 module.exports = mongoose.model('CylinderHistory', cylinderHistorySchema);

@@ -15,7 +15,13 @@ beforeAll(async () => {
   await LocationProfile.syncIndexes();
   const user = await User.create({ name: 'B2', email: 'b2@test.com', password: 'Test1234!' });
   uid = user._id;
-  await profileSvc.getLocationProfiles(uid);   // seeds the three sites, Chandisar flagged
+  // GEN-C: getLocationProfiles now seeds ONE generic site into an empty account, not Guru's three.
+  // These tests exercise the legacy codes, so they create them outright.
+  await LocationProfile.create([
+    { user_id: uid, location: 'AT_PLANT_CHANDISAR', label: 'Chandisar Plant', is_filling_location: true },
+    { user_id: uid, location: 'AT_PALANPUR_OFFICE', label: 'Palanpur Office' },
+    { user_id: uid, location: 'AT_CHHAPI_OFFICE', label: 'Chhapi Office' }
+  ]);
 });
 
 afterAll(async () => {
@@ -147,9 +153,14 @@ describe('moving the filling flag', () => {
 describe('a failure part-way through the swap', () => {
   test('never leaves two locations flagged, and the account recovers', async () => {
     const u = await User.create({ name: 'B2f', email: 'b2f@test.com', password: 'Test1234!' });
-    await profileSvc.getLocationProfiles(u._id);
+    // GEN-C: a brand-new account is seeded with ONE generic site, already flagged as filling.
+    const seeded = await profileSvc.getLocationProfiles(u._id);
+    expect(seeded.profiles.map(p => p.location)).toEqual(['AT_MAIN_PLANT']);
     const flaggedFor = async () => (await LocationProfile.find({ user_id: u._id, is_filling_location: true })).map(p => p.location);
-    expect(await flaggedFor()).toEqual([CH]);
+    expect(await flaggedFor()).toEqual(['AT_MAIN_PLANT']);
+
+    // A second site to move the flag to later.
+    await LocationProfile.create({ user_id: u._id, location: PA, label: 'Palanpur Office' });
 
     // Simulate the crash window: the old flag is cleared, the new one never gets set.
     await LocationProfile.updateMany({ user_id: u._id, is_filling_location: true }, { $set: { is_filling_location: false } });

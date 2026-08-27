@@ -10,7 +10,7 @@
 // far more expensive than the query it would save. (Callers may hold the result for the duration
 // of one request; that is fine and is what the report services do.)
 const LocationProfile = require('../models/LocationProfile');
-const { LOCATIONS, LOCATION_LABELS } = require('../config/locations');
+const { LOCATIONS, LOCATION_LABELS, DEFAULT_NEW_ACCOUNT_LOCATION } = require('../config/locations');
 
 /**
  * @returns {Promise<{codes: string[], labels: Object<string,string>, fillingLocationCode: string|null, profiles: Array}>}
@@ -29,9 +29,10 @@ async function getUserLocations(userId) {
   // No records at all (a brand-new account before profile.service seeds it, or a test fixture):
   // fall back to the seed list read-only, so a read path never has to write.
   if (!profiles.length) {
-    const labels = {};
-    LOCATIONS.forEach(l => { labels[l] = LOCATION_LABELS[l] || l; });
-    return { codes: [...LOCATIONS], labels, fillingLocationCode: LEGACY_FILLING, profiles: [] };
+    // GEN-C: the same single generic site profile.service will seed on first write. It used to
+    // return Guru's three, which meant a brand-new account briefly reported sites it did not own.
+    const { code, label } = DEFAULT_NEW_ACCOUNT_LOCATION;
+    return { codes: [code], labels: { [code]: label }, fillingLocationCode: code, profiles: [] };
   }
 
   const codes = [];

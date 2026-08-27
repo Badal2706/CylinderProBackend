@@ -22,6 +22,15 @@ exports.getCylinderHistory = asyncHandler(async (req, res) => {
   res.json(await cylinderHistoryService.getHistory(req.user.id, req.params.id));
 });
 
+// GEN-C: step-up gated full history, paginated. The gate is the route's middleware, not this
+// handler — by the time we get here the approval has already been verified.
+exports.getCylinderHistoryPage = asyncHandler(async (req, res) => {
+  res.json(await cylinderHistoryService.getHistoryPage(req.user.id, req.params.id, {
+    skip: req.query.skip,
+    limit: req.query.limit
+  }));
+});
+
 exports.createCylinder = asyncHandler(async (req, res) => {
   res.json(await cylinderService.createCylinder(req.user.id, req.body));
 });

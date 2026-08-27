@@ -67,11 +67,24 @@ const billLineItemSchema = new mongoose.Schema({
 
 const billSchema = new mongoose.Schema({
   user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  // Lifelong editable — it is matched against the customer's other software, so it must stay
+   // changeable. Uniqueness is NOT global any more (GEN-C): it is scoped to
+   // (account_code, financial_year), so 1A001 may legitimately return next financial year.
   bill_number: {
     type: String,
-    required: true,
-    unique: true
+    required: true
   },
+  // ─── Phase GEN-C: numbering identity ───
+  // account_code denormalised from User so a stray document is always traceable to its account,
+  // and so the unique index can be enforced without a join.
+  account_code: { type: String, default: '', index: true },
+  // "2026-27". Derived from bill_date in IST (1 Apr → 31 Mar). Recomputed whenever bill_date
+  // changes, which is why a date edit can move a bill into a year where its number is taken.
+  financial_year: { type: String, default: '', index: true },
+  // The searchable business identity: "<account_code>-<FY4>-<bill_number>", e.g.
+  // "K7M2X9Q4-2627-1A001". Derived and kept in sync by the pre-validate hook below — never set
+  // by hand. Distinguishes 1A001 of 2026-27 from 1A001 of 2027-28 years after the fact.
+  bill_uid: { type: String, default: '', index: true },
   // CUSTOMER = normal bill against a customer; INTERNAL_TRANSFER = moving our own
   // cylinders between sites (no customer, no amounts).
   transaction_category: {
@@ -198,7 +211,74 @@ const billSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Indexes for common queries (bill_number is already unique-indexed above).
+// GEN-C: keep the derived numbering fields in step with bill_date and bill_number. Runs on
+// every save, including bill-number and bill-date edits.
+billSchema.pre('validate', async function () {
+  const { financialYear, buildUid } = require('../services/numbering.service');
+  // Filled here rather than at each creation site, so a new one cannot forget it. Immutable
+  // once set, and the lookup behind this is cached for the life of the process.
+  if (!this.account_code && this.user_id) {
+    try {
+      this.account_code = await require('../services/accountNumbering.service').accountCodeFor(this.user_id);
+    } catch { /* leave blank — the migration backfills, and buildUid returns '' meanwhile */ }
+  }
+  if (this.bill_date) {
+    try { this.financial_year = financialYear(this.bill_date); } catch { /* leave as-is */ }
+  }
+  this.bill_uid = buildUid(this.account_code, this.financial_year, this.bill_number);
+});
+
+
+// GEN-C: findOneAndUpdate / updateOne / updateMany bypass DOCUMENT middleware entirely, so a
+// direct write touching bill_date or bill_number would leave financial_year and the uid
+// STALE — silently scoping the uniqueness check to the wrong year and making the record
+// unfindable by its identity. payment.service.updatePayment does exactly this kind of write.
+// Recompute here so there is one rule regardless of how the write arrives.
+// NOTE: async hooks must NOT declare a `next` parameter — Mongoose awaits the returned promise
+// and passes no callback, so calling next() throws "next is not a function". Errors propagate by
+// being thrown.
+async function syncNumberingOnQuery() {
+  const update = this.getUpdate() || {};
+  const $set = update.$set || {};
+
+  // A field can arrive EITHER at the top level ({ bill_date: x }) or inside $set. Both forms
+  // reach this hook, and `timestamps: true` guarantees $set already exists (Mongoose puts
+  // updatedAt there before middleware runs) — so `update.$set || update` would silently read the
+  // timestamp object, find no bill_date, and skip the sync entirely.
+  const read = (f) => ($set[f] !== undefined ? $set[f] : update[f]);
+
+  const nextDate = read('bill_date');
+  const nextNumber = read('bill_number');
+  if (nextDate === undefined && nextNumber === undefined) return;
+
+  // Whatever is NOT being written still has to come from the stored document.
+  const current = await this.model
+    .findOne(this.getQuery())
+    .select('account_code bill_date bill_number')
+    .lean();
+  if (!current) return;
+
+  const { financialYear, buildUid } = require('../services/numbering.service');
+  const date = nextDate !== undefined ? nextDate : current.bill_date;
+  const number = nextNumber !== undefined ? nextNumber : current.bill_number;
+  const fy = financialYear(date);
+
+  // Written into $set specifically: a plain top-level assignment would be dropped if the caller
+  // used operator form.
+  update.$set = Object.assign({}, $set, {
+    financial_year: fy,
+    bill_uid: buildUid(current.account_code, fy, number)
+  });
+  this.setUpdate(update);
+}
+billSchema.pre('findOneAndUpdate', syncNumberingOnQuery);
+billSchema.pre('updateOne', syncNumberingOnQuery);
+billSchema.pre('updateMany', syncNumberingOnQuery);
+// Indexes for common queries.
+// GEN-C: bill numbers are unique per (account, financial year) — NOT globally as before.
+// This is what lets a second CylinderPro client issue their own 1A001, and what lets an account
+// that opted into financial-year reset legitimately reuse 1A001 next April.
+billSchema.index({ account_code: 1, financial_year: 1, bill_number: 1 }, { unique: true });
 billSchema.index({ user_id: 1, customer_id: 1 });   // per-customer history
 billSchema.index({ user_id: 1, bill_date: -1 });     // daily report / date filters
 billSchema.index({ user_id: 1, createdAt: -1 });     // recent-first listings

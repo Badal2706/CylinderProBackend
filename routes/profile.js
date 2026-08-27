@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
-const { requireStepUpAuth } = require('../middleware/stepUp');
+const { requireStepUpAuth, stepUpGate } = require('../middleware/stepUp');
 const validate = require('../middleware/validate');
 const V = require('../validators/schemas');
 const ctrl = require('../controllers/profile.controller');
@@ -29,8 +29,20 @@ router.put('/locations', requireStepUpAuth, ctrl.updateLocationProfilesBatch);
 router.put('/locations/:location', requireStepUpAuth, ctrl.updateLocationProfile);
 router.get('/audit-log', ctrl.getAuditLog);
 router.patch('/active-location', ctrl.setActiveLocation);
+// Confirms the account password alone. Lets the UI stop a wrong password before it drags the
+// operator through owner approval — see profile.service.verifyPassword.
+router.post('/verify-password', ctrl.verifyPassword);
 router.post('/logout-all', ctrl.logoutAll);
 router.delete('/delete-account', ctrl.deleteAccount);
 router.get('/export-data', ctrl.exportData);
+// Phase GEN-C: the disaster-recovery backup. Step-up gated because, unlike the report export
+// above, this archive is enough to reconstruct the entire account elsewhere.
+router.get('/backup', stepUpGate('Downloading a full backup'), ctrl.exportBackup);
+// Restore. Preview parses and validates the uploaded archive and writes NOTHING; confirm starts
+// the job and returns immediately, with progress polled from /restore/status. All three are
+// step-up gated — a restore replaces an entire account's contents.
+router.post('/restore/preview', stepUpGate('Restoring from a backup'), ctrl.restorePreview);
+router.post('/restore/confirm', stepUpGate('Restoring from a backup'), ctrl.restoreConfirm);
+router.get('/restore/status/:jobId', ctrl.restoreStatus);
 
 module.exports = router;

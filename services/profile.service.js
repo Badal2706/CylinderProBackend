@@ -23,7 +23,7 @@ const Cylinder = require('../models/Cylinder');
 const LocationProfile = require('../models/LocationProfile');
 const RentalCharge = require('../models/RentalCharge');
 const HttpError = require('../utils/HttpError');
-const { LOCATIONS, LOCATION_LABELS } = require('../config/locations');
+const { LOCATIONS, LOCATION_LABELS, DEFAULT_NEW_ACCOUNT_LOCATION } = require('../config/locations');
 const locationService = require('./location.service');
 
 // DD/MM/YYYY for exports
@@ -51,30 +51,29 @@ async function getAccount(userId) {
   };
 }
 
-// ─── Location profiles (Phase 2) ───
-// Fixed set of 3 per user (one per site). Lazily seeds any missing records so the
-// migration script and brand-new signups both end up with the full set.
+// ─── Location profiles (Phase 2, reshaped in GEN-C) ───
+// Seeds ONE generic site into a brand-new account, and never touches an account that already has
+// a registry.
+//
+// It used to top up any "missing" location from config/locations.js, which had two faults. It
+// handed every new client Guru Industries' three sites — someone else's plants, which they could
+// rename but not delete (F-07). And because the check was per-location rather than
+// all-or-nothing, changing the seed list would have silently ADDED a location to every existing
+// account, including the live one.
 async function getLocationProfiles(userId) {
   const existing = await LocationProfile.find({ user_id: userId });
-  const have = new Set(existing.map(p => p.location));
-  // config/locations.js is now ONLY a seed list for an account that has no registry yet — never
-  // the runtime source of truth. A user who later adds a fourth site keeps it; nothing here
-  // removes or re-adds anything once records exist.
-  const missing = LOCATIONS.filter(l => !have.has(l));
-  if (missing.length) {
-    // Insert one at a time and tolerate races on the unique (user_id, location) index.
-    for (const location of missing) {
-      try {
-        existing.push(await LocationProfile.create({
-          user_id: userId,
-          location,
-          label: LOCATION_LABELS[location] || location,
-          // Seed the historical anchor. The partial unique index guarantees at most one, so a
-          // race here surfaces as a duplicate-key error rather than two filling sites.
-          is_filling_location: location === 'AT_PLANT_CHANDISAR' && !existing.some(x => x.is_filling_location)
-        }));
-      } catch (e) { if (e.code !== 11000) throw e; }
-    }
+
+  // All-or-nothing on purpose: an account with ANY registry is left exactly as it is.
+  if (!existing.length) {
+    try {
+      existing.push(await LocationProfile.create({
+        user_id: userId,
+        location: DEFAULT_NEW_ACCOUNT_LOCATION.code,
+        label: DEFAULT_NEW_ACCOUNT_LOCATION.label,
+        // Something must fill, or DSR, Stock Summary and the filling log have no anchor.
+        is_filling_location: true
+      }));
+    } catch (e) { if (e.code !== 11000) throw e; }   // tolerate a race on (user_id, location)
   }
   const user = await User.findById(userId).select('active_location');
   // Ordered by the registry, not by the static array — a location added later still appears.
@@ -448,9 +447,19 @@ async function getBusinessProfile(userId) {
     profile = {
       business_name: '', business_address: '', business_phone: '', gst_number: '',
       certification_line: '', business_email: '', products_line: '', contact_lines: [],
-      logo_scale: 100, logo: ''
+      logo_scale: 100, logo: '', fy_reset_numbering: false
     };
   }
+
+  // Phase GEN-C: the financial-year choice, and whether it can still be changed. The deadline is
+  // this account's OWN first 1 April, measured from when it was created — a client who buys the
+  // software later gets their own full window rather than inheriting someone else's.
+  const numbering = require('./numbering.service');
+  const user = await User.findById(userId).select('createdAt').lean();
+  const activatedAt = (user && user.createdAt) || new Date();
+  const lockDate = numbering.firstAprilAfter(activatedAt);
+  const locked = numbering.isFyChoiceLocked(activatedAt);
+
   return {
     business_name: profile.business_name || '',
     business_address: profile.business_address || '',
@@ -461,15 +470,45 @@ async function getBusinessProfile(userId) {
     products_line: profile.products_line || '',
     contact_lines: Array.isArray(profile.contact_lines) ? profile.contact_lines.map(String) : [],
     logo_scale: Number(profile.logo_scale) > 0 ? Number(profile.logo_scale) : 100,
-    logo: profile.logo || ''
+    logo: profile.logo || '',
+    // GEN-C numbering
+    fy_reset_numbering: !!profile.fy_reset_numbering,
+    fy_choice_locked: locked,
+    fy_lock_date: lockDate,
+    account_code: '' // never exposed: it is a backend identity, not something an operator sees
   };
 }
 
 async function updateBusinessProfile(userId, {
   business_name, business_address, business_phone, gst_number,
-  certification_line, business_email, products_line, contact_lines, logo_scale, logo
+  certification_line, business_email, products_line, contact_lines, logo_scale, logo,
+  fy_reset_numbering
 }) {
   const update = {};
+
+  // ─── Phase GEN-C: the financial-year numbering choice ───
+  // Changeable ONLY until this account has lived through its first 1 April. After that the
+  // series has a year of real documents behind it, and flipping the rule would either duplicate
+  // numbers already issued or silently skip a year — so it is frozen permanently.
+  if (fy_reset_numbering !== undefined && fy_reset_numbering !== null) {
+    const numbering = require('./numbering.service');
+    const user = await User.findById(userId).select('createdAt').lean();
+    const activatedAt = (user && user.createdAt) || new Date();
+    const current = await BusinessProfile.findOne({ user_id: userId }).select('fy_reset_numbering').lean();
+    const wanted = !!fy_reset_numbering;
+
+    // Re-saving the same value is not a change — the Settings form posts the whole card, so a
+    // locked account must still be able to edit its letterhead.
+    if (wanted !== !!(current && current.fy_reset_numbering)) {
+      if (numbering.isFyChoiceLocked(activatedAt)) {
+        const on = new Date(numbering.firstAprilAfter(activatedAt)).toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' });
+        throw new HttpError(400,
+          `The financial-year numbering choice was locked on ${on}, the first 1 April after this account was created. ` +
+          'It cannot be changed once a full year of bills has been issued under it.');
+      }
+      update.fy_reset_numbering = wanted;
+    }
+  }
   if (business_name !== undefined) update.business_name = business_name;
   if (business_address !== undefined) update.business_address = business_address;
   if (business_phone !== undefined) update.business_phone = business_phone;
@@ -500,6 +539,20 @@ async function updateBusinessProfile(userId, {
   return { message: 'Business profile saved', profile };
 }
 
+// Phase GEN-C: confirm the account password on its own, so the UI can reject a wrong one
+// BEFORE sending the operator through an owner-approval flow. Previously the password was only
+// checked at the very end, so a typo meant completing the whole approval and only then being
+// told. Deliberately reveals nothing beyond valid/invalid.
+async function verifyPassword(userId, password) {
+  const user = await User.findById(userId);
+  if (!user) throw new HttpError(404, 'User not found');
+  // 400, not 401 — a wrong password must never trip the client's expired-session auto-logout.
+  if (!password || !(await user.comparePassword(password))) {
+    throw new HttpError(400, 'Incorrect password');
+  }
+  return { verified: true };
+}
+
 async function logoutAll(userId) {
   await User.updateOne({ _id: userId }, { $inc: { token_version: 1 } });
   return { message: 'All sessions logged out' };
@@ -516,23 +569,25 @@ async function deleteAccount(userId, password, stepUpToken) {
   }
   await require('./stepup.service').requireOwnerStepUp(userId, stepUpToken, 'Deleting the account');
 
-  await Promise.all([
-    Customer.deleteMany({ user_id: userId }),
-    Bill.deleteMany({ user_id: userId }),
-    Payment.deleteMany({ user_id: userId }),
-    Cylinder.deleteMany({ user_id: userId }),
-    BusinessProfile.deleteMany({ user_id: userId }),
-    LocationProfile.deleteMany({ user_id: userId }),
-    RentalCharge.deleteMany({ user_id: userId }),
-    require('../models/FillingLogEntry').deleteMany({ user_id: userId }),
-    require('../models/LocationPcStock').deleteMany({ user_id: userId }),
-    require('../models/TrustedPerson').deleteMany({ user_id: userId }),
-    require('../models/OtpToken').deleteMany({ user_id: userId }),
-    require('../models/AuditLog').deleteMany({ user_id: userId })
-  ]);
+  // The purge list is DERIVED from backup.service.COLLECTIONS — the same list the backup and
+  // restore paths walk — plus the login/approval records a backup deliberately excludes. It used
+  // to be hand-written here, and had silently fallen behind: CylinderHistory, Counter and
+  // RestoreJob were all missed, so a deleted account left thousands of orphaned history rows and
+  // its bill counter behind. Deriving it means a new collection cannot be forgotten again.
+  const backupSvc = require('./backup.service');
+  const targets = backupSvc.COLLECTIONS
+    .filter(c => c.scope === 'user')
+    .map(c => c.model)
+    .concat(['TrustedPerson', 'OtpToken', 'RestoreJob']);
+
+  const removed = {};
+  for (const name of targets) {
+    const r = await require(`../models/${name}`).deleteMany({ user_id: userId });
+    if (r.deletedCount) removed[name] = r.deletedCount;
+  }
   await User.deleteOne({ _id: userId });
 
-  return { message: 'Your account has been deleted.' };
+  return { message: 'Your account has been deleted.', removed };
 }
 
 // Streams a ZIP of xlsx files for all of the user's data directly to `res`.
@@ -676,6 +731,7 @@ module.exports = {
   logoutAll,
   deleteAccount,
   exportData,
+  verifyPassword,
   requestEmailChange,
   confirmEmailChange
 };

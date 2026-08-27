@@ -108,6 +108,10 @@ async function signupConfirm({ pending_token, code, remember, device, ip }) {
   if (existingCheck) throw new HttpError(400, 'Email is already registered');
 
   const user = new User({ name: payload.name, email: payload.email, password: payload.password });
+  // Phase GEN-C: derive the permanent account code NOW, from the _id Mongoose has already
+  // assigned. It is immutable once saved, and every bill and receipt identity is built on it —
+  // an account created without one would issue documents with a blank identity.
+  user.account_code = require('./numbering.service').deriveAccountCode(user._id);
   await user.save();
 
   try {
@@ -336,32 +340,8 @@ async function resetPassword({ reset_token, code, totp_code, new_password }) {
   return { message: 'Password updated. Please sign in with your new password.' };
 }
 
-// Phase 21: like account deletion, clearing all data needs BOTH the password AND an
-// owner-only step-up approval — no other trusted person can authorize it.
-async function clearData(userId, password, stepUpToken) {
-  if (!password) throw new HttpError(400, 'Password is required to confirm');
-
-  const user = await User.findById(userId);
-  // 400 (not 401) — a wrong password must never trigger the client's expired-session auto-logout.
-  if (!user || !(await user.comparePassword(password))) {
-    throw new HttpError(400, 'Incorrect password');
-  }
-  await require('./stepup.service').requireOwnerStepUp(userId, stepUpToken, 'Clearing all data');
-
-  await Promise.all([
-    Customer.deleteMany({ user_id: userId }),
-    Bill.deleteMany({ user_id: userId }),
-    Payment.deleteMany({ user_id: userId }),
-    RentalCharge.deleteMany({ user_id: userId }), // charges reference the deleted customers
-    require('../models/FillingLogEntry').deleteMany({ user_id: userId }),
-    require('../models/LocationPcStock').deleteMany({ user_id: userId })
-  ]);
-
-  return { message: 'All data cleared successfully' };
-}
-
 module.exports = {
-  signupRequest, signupConfirm, signin, verify2fa, refresh, clearData,
+  signupRequest, signupConfirm, signin, verify2fa, refresh,
   listSessions, revokeSession,
   sendEmailVerification, confirmEmailVerification, securityStatus,
   requestPasswordReset, resetPassword

@@ -94,6 +94,9 @@ const businessProfile = z.object({
   contact_lines: z.array(z.string().max(300, 'a contact line must be 300 characters or fewer'))
     .max(20, 'too many contact lines').optional().nullable(),
   logo_scale: optNumericLike,
+  // Phase GEN-C: whether the bill/receipt series restarts each 1 April. Whether the caller is
+  // still ALLOWED to change it is a business rule, enforced in profile.service, not here.
+  fy_reset_numbering: z.boolean().optional().nullable(),
   logo: z.string()
     .max(1_500_000, 'logo image is too large')
     .refine(v => v === '' || /^data:image\/(png|jpe?g|gif|webp|svg\+xml);base64,/.test(v),

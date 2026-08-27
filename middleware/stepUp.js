@@ -5,14 +5,21 @@ const { requireStepUp, tryStepUp } = require('../services/stepup.service');
 // Responds 403 (never 401 — that would trip the frontend's session-expiry logout).
 
 // For authenticated routes: token must belong to the logged-in user.
-function requireStepUpAuth(req, res, next) {
-  try {
-    req.stepUp = requireStepUp(req.user.id, req.headers['x-step-up-token'] || (req.body && req.body.step_up_token), 'Saving this change');
-    next();
-  } catch (e) {
-    res.status(e.status || 403).json({ error: e.message, code: 'STEP_UP_REQUIRED' });
-  }
+// `label` opens the message. It defaults to "Saving this change" because every gated route was a
+// save until GEN-C added the first read-only one (the full cylinder history), where that wording
+// would tell the operator they were about to change something they were only trying to read.
+function stepUpGate(label) {
+  return function (req, res, next) {
+    try {
+      req.stepUp = requireStepUp(req.user.id, req.headers['x-step-up-token'] || (req.body && req.body.step_up_token), label);
+      next();
+    } catch (e) {
+      res.status(e.status || 403).json({ error: e.message, code: 'STEP_UP_REQUIRED' });
+    }
+  };
 }
+
+const requireStepUpAuth = stepUpGate('Saving this change');
 
 // For the deliberately-unauthenticated masters routes: any user's valid step-up token
 // authorizes the change (the token itself proves a trusted person approved); the token's
@@ -28,4 +35,4 @@ function requireStepUpAny(req, res, next) {
   }
 }
 
-module.exports = { requireStepUpAuth, requireStepUpAny };
+module.exports = { requireStepUpAuth, requireStepUpAny, stepUpGate };

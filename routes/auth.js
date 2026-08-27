@@ -11,7 +11,6 @@ router.post('/signin/verify-2fa', ctrl.verify2fa);
 router.post('/forgot-password', ctrl.forgotPasswordRequest);
 router.post('/forgot-password/reset', ctrl.forgotPasswordReset);
 router.post('/refresh', authMiddleware, ctrl.refresh);
-router.post('/clear-data', authMiddleware, ctrl.clearData);
 
 // Sessions & devices (Phase 17)
 router.get('/sessions', authMiddleware, ctrl.listSessions);

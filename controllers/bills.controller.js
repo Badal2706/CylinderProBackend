@@ -57,7 +57,7 @@ exports.listDrafts = asyncHandler(async (req, res) => {
 
 // Phase 27: the next bill number in sequence, to prefill the form (the user may still edit it).
 exports.getNextBillNumber = asyncHandler(async (req, res) => {
-  res.json({ bill_number: await billService.generateBillNumber() });
+  res.json({ bill_number: await billService.generateBillNumber(req.user.id) });
 });
 
 exports.getTodayStats = asyncHandler(async (req, res) => {

@@ -49,7 +49,13 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(bodyParser.json({ limit: '5mb' }));
+// Phase GEN-C: the backup upload arrives as a raw .zip body, streamed straight to disk. It must
+// NOT pass through bodyParser — the 5 MB JSON limit would reject it, and base64-in-JSON would
+// inflate a large backup by a third for no reason. Excluded by path so the rest of the API keeps
+// its normal parsing.
+const RESTORE_UPLOAD_PATH = '/api/profile/restore/preview';
+const jsonParser = bodyParser.json({ limit: '5mb' });
+app.use((req, res, next) => (req.path === RESTORE_UPLOAD_PATH ? next() : jsonParser(req, res, next)));
 app.use(bodyParser.urlencoded({ extended: true }));
 
 // --- NoSQL injection sanitization (Express 5 safe) ---
@@ -60,6 +66,15 @@ app.use(mongoSanitize);
 // in-memory store, correct for the current SINGLE PM2 process. PHASE-30 NOTE: if PM2 is ever moved
 // to cluster mode / multiple instances, the in-memory counters become per-process and must be
 // backed by a shared store (Redis) — flag before switching.
+
+// Phase GEN-C: fail at boot, not at the first signup. Every bill and receipt identity is built
+// on the account code this salt derives, so a server running without it would quietly issue
+// documents with a blank identity. Same posture as JWT_SECRET in middleware/auth.js.
+if (!process.env.NUMBERING_SALT) {
+  throw new Error('FATAL: NUMBERING_SALT environment variable is not set. It seeds the permanent ' +
+                  'per-account numbering code. Set it before starting the server, and keep it ' +
+                  'backed up alongside JWT_SECRET.');
+}
 
 // Connect to MongoDB
 connectDB();

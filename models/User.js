@@ -6,6 +6,11 @@ const SALT_ROUNDS = 10; // minimum per security policy
 const userSchema = new mongoose.Schema({
   name:  { type: String, required: true, trim: true },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  // Phase GEN-C: 8-character [A-Z0-9] code derived ONCE at signup from this account's _id plus
+  // NUMBERING_SALT (services/numbering.service.js). Stored, never re-derived on read — so
+  // rotating the salt cannot make existing data unreadable, and it is immutable because bill and
+  // receipt identities are built on it. Never shown in the UI or on a printed document.
+  account_code: { type: String, default: '', immutable: true, index: true },
   password: { type: String, required: true },
   phone: { type: String, default: '' },
   // Site the user is currently "operating as" — drives UI defaults only (never rewrites data).

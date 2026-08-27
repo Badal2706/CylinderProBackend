@@ -1,5 +1,7 @@
 const asyncHandler = require('../middleware/asyncHandler');
 const profileService = require('../services/profile.service');
+const backupService = require('../services/backup.service');
+const restoreService = require('../services/restore.service');
 const logger = require('../logger');
 
 exports.getAccount = asyncHandler(async (req, res) => {
@@ -88,6 +90,10 @@ exports.setActiveLocation = asyncHandler(async (req, res) => {
   res.json(await profileService.setActiveLocation(req.user.id, req.body.location));
 });
 
+exports.verifyPassword = asyncHandler(async (req, res) => {
+  res.json(await profileService.verifyPassword(req.user.id, req.body && req.body.password));
+});
+
 exports.logoutAll = asyncHandler(async (req, res) => {
   res.json(await profileService.logoutAll(req.user.id));
 });
@@ -97,6 +103,34 @@ exports.deleteAccount = asyncHandler(async (req, res) => {
   res.json(await profileService.deleteAccount(req.user.id, req.body.password,
     req.headers['x-step-up-token'] || req.body.step_up_token));
 });
+
+// ─── Phase GEN-C: restore ───
+// The request body IS the .zip (bodyParser is bypassed for this path in server.js), so the
+// service consumes `req` as a stream rather than reading req.body.
+exports.restorePreview = asyncHandler(async (req, res) => {
+  res.json(await restoreService.previewRestore(req.user.id, req));
+});
+
+exports.restoreConfirm = asyncHandler(async (req, res) => {
+  res.json(await restoreService.confirmRestore(req.user.id, req.body && req.body.restore_token));
+});
+
+exports.restoreStatus = asyncHandler(async (req, res) => {
+  res.json(await restoreService.getRestoreStatus(req.user.id, req.params.jobId));
+});
+
+// Phase GEN-C: the full-fidelity BACKUP, not the XLSX report export below. Same streaming
+// error handling: headers are already sent once the archive starts, so a mid-stream failure
+// cannot be turned into a JSON error response.
+exports.exportBackup = async (req, res) => {
+  try {
+    await backupService.exportBackup(req.user.id, res);
+  } catch (err) {
+    logger.error(`exportBackup failed: ${err.stack || err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: 'Could not generate the backup. Please try again.' });
+    else res.destroy();
+  }
+};
 
 // Streams a ZIP directly to res — keeps its own error handling (matching the original
 // behavior) since headers may already be sent by the time an error occurs mid-stream.
