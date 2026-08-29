@@ -21,10 +21,15 @@ async function getCustomerStats(customerId) {
   const { totalGiven, totalReceived, held, totalBillAmount } = computeHoldings(bills, { isVendor: !!(cust && cust.is_filling_vendor) });
 
   const payments = await Payment.find({ customer_id: customerId });
-  // Phase 14 (final): Total Received = Σ NET amount per payment (Amount Received − Discount);
-  // Amount Due = Total Billed − Total Received(net) − Total Discount.
-  // e.g. Billed 5600, Received 5600, Discount 100 → net 5500, due 5600 − 5500 − 100 = 0.
-  const totalNetReceived = payments.reduce((sum, p) => sum + (p.amount_received || 0) - (p.discount || 0), 0);
+  // Canonical rule: `amount_received` is the CASH figure alone, and a discount settles the
+  // balance exactly like cash does. So Amount Due = Total Billed - Cash Received - Discount.
+  // e.g. Billed 16695, Received 16600, Discount 95 -> due 16695 - 16600 - 95 = 0.
+  //
+  // This sum used to subtract the discount too. Combined with the `- totalDiscount` term below
+  // that cancelled the discount out entirely, leaving the customer still owing it. Note that
+  // ADDING the discount here instead would credit it twice -- `- totalDiscount` already covers
+  // it, so the cash figure alone is what belongs in this sum.
+  const totalCashReceived = payments.reduce((sum, p) => sum + (p.amount_received || 0), 0);
   const totalDiscount = payments.reduce((sum, p) => sum + (p.discount || 0), 0);
 
   return {
@@ -32,9 +37,9 @@ async function getCustomerStats(customerId) {
     total_received_qty: totalReceived,
     cylinders_held: held,
     total_billed: totalBillAmount,
-    total_received: totalNetReceived,
+    total_received: totalCashReceived,
     total_discount: totalDiscount,
-    current_bill_amount: totalBillAmount - totalNetReceived - totalDiscount
+    current_bill_amount: totalBillAmount - totalCashReceived - totalDiscount
   };
 }
 
@@ -99,7 +104,8 @@ async function listCustomers(userId, { search, status, page, limit, include_hidd
       { $match: { customer_id: { $in: customerIds } } },
       { $group: {
         _id: '$customer_id',
-        totalNetReceived: { $sum: { $subtract: [{ $ifNull: ['$amount_received', 0] }, { $ifNull: ['$discount', 0] }] } },
+        // Cash only -- the discount is applied once, via totalDiscount below.
+        totalCashReceived: { $sum: { $ifNull: ['$amount_received', 0] } },
         totalDiscount: { $sum: { $ifNull: ['$discount', 0] } }
       } }
     ]).then(groups => {
@@ -112,7 +118,7 @@ async function listCustomers(userId, { search, status, page, limit, include_hidd
   const customersWithStats = customers.map(customer => {
     const cid = String(customer._id);
     const bs = billStats[cid] || { bills: [], totalBillAmount: 0 };
-    const ps = paymentStats[cid] || { totalNetReceived: 0, totalDiscount: 0 };
+    const ps = paymentStats[cid] || { totalCashReceived: 0, totalDiscount: 0 };
     const { held, totalGiven, totalReceived } = computeHoldings(bs.bills, { isVendor: !!customer.is_filling_vendor });
     return {
       ...customer,
@@ -121,9 +127,9 @@ async function listCustomers(userId, { search, status, page, limit, include_hidd
       total_received_qty: totalReceived,
       cylinders_held: held,
       total_billed: bs.totalBillAmount,
-      total_received: ps.totalNetReceived,
+      total_received: ps.totalCashReceived,
       total_discount: ps.totalDiscount,
-      current_bill_amount: bs.totalBillAmount - ps.totalNetReceived - ps.totalDiscount,
+      current_bill_amount: bs.totalBillAmount - ps.totalCashReceived - ps.totalDiscount,
       status: (!customer.is_filling_vendor && held > (customer.holding_limit || 0)) ? 'OVER LIMIT' :
               customer.is_active ? 'ACTIVE' : 'INACTIVE'
     };
@@ -162,7 +168,15 @@ async function getCustomerDetail(userId, customerId) {
 
   const { totalGiven, totalReceived, held: cylindersHeld, totalBillAmount,
     breakdown: heldBreakdown, heldSerials } = computeHoldings(bills, { isVendor: !!customer.is_filling_vendor });
-  const totalNetReceived = payments.reduce((sum, p) => sum + (p.amount_received || 0) - (p.discount || 0), 0);
+  // Canonical rule: `amount_received` is the CASH figure alone, and a discount settles the
+  // balance exactly like cash does. So Amount Due = Total Billed - Cash Received - Discount.
+  // e.g. Billed 16695, Received 16600, Discount 95 -> due 16695 - 16600 - 95 = 0.
+  //
+  // This sum used to subtract the discount too. Combined with the `- totalDiscount` term below
+  // that cancelled the discount out entirely, leaving the customer still owing it. Note that
+  // ADDING the discount here instead would credit it twice -- `- totalDiscount` already covers
+  // it, so the cash figure alone is what belongs in this sum.
+  const totalCashReceived = payments.reduce((sum, p) => sum + (p.amount_received || 0), 0);
   const totalDiscount = payments.reduce((sum, p) => sum + (p.discount || 0), 0);
 
   const breakdown = {};
@@ -225,9 +239,9 @@ async function getCustomerDetail(userId, customerId) {
     total_received_qty: totalReceived,
     cylinders_held: cylindersHeld,
     total_billed: totalBillAmount,
-    total_received: totalNetReceived,
+    total_received: totalCashReceived,
     total_discount: totalDiscount,
-    current_bill_amount: totalBillAmount - totalNetReceived - totalDiscount,
+    current_bill_amount: totalBillAmount - totalCashReceived - totalDiscount,
     cylinder_breakdown: Object.values(breakdown).filter(b => b.currently_held !== 0 || b.total_given > 0),
     held_cylinders,
     status: (!customer.is_filling_vendor && cylindersHeld > (customer.holding_limit || 0)) ? 'OVER LIMIT' : 'ACTIVE'
@@ -377,16 +391,24 @@ async function deleteCustomerCascade(userId, customerId) {
     }, opts);
     // RentalCharge also carries customer_id — leaving these behind would orphan them.
     const rentRes = await RentalCharge.deleteMany({ customer_id: customer._id }, opts);
+    // F-11: purity certificates snapshot the customer's name and address, so they would still
+    // RENDER after the customer went away — but the only way to reach one is through the customer
+    // detail page that no longer exists, so they would be unreachable rows pointing at a dead id.
+    // Same reasoning as RentalCharge above. (This is the customer being deleted, not the
+    // certificate: deleting a certificate on its own still touches nothing else.)
+    const PurityCertificate = require('../models/PurityCertificate');
+    const certRes = await PurityCertificate.deleteMany({ customer_id: customer._id }, opts);
     const billRes = await Bill.deleteMany({ customer_id: customer._id }, opts);
     await Customer.deleteOne({ _id: customer._id, user_id: userId }, opts);
     return {
       payments: payRes.deletedCount || 0,
       bills: billRes.deletedCount || 0,
-      rental_charges: rentRes.deletedCount || 0
+      rental_charges: rentRes.deletedCount || 0,
+      purity_certificates: certRes.deletedCount || 0
     };
   };
 
-  // Production (Atlas) is a replica set, so this runs as a real transaction and the four
+  // Production (Atlas) is a replica set, so this runs as a real transaction and all five
   // deletes commit or roll back together. A standalone mongod — which is what local Docker
   // dev uses — cannot do transactions at all, so we fall back to a sequenced delete there.
   //
@@ -423,7 +445,8 @@ async function deleteCustomerCascade(userId, customerId) {
       customer: 1,
       bills: counts.bills,
       payments: counts.payments,
-      rental_charges: counts.rental_charges
+      rental_charges: counts.rental_charges,
+      purity_certificates: counts.purity_certificates
     }
   };
 }

@@ -17,6 +17,7 @@ const { LOCATIONS, LOCATION_LABELS, DEFAULT_NEW_ACCOUNT_LOCATION } = require('..
  *   codes  - every location code configured for this user, in stable order
  *   labels - code -> display name
  *   fillingLocationCode - the site that fills, or null when the user has none configured
+ *   maintenanceLocationCode - the site that services faulty cylinders (the workshop)
  */
 // The pre-GEN-B1 world: three fixed sites with Chandisar filling. Used ONLY as a fallback for an
 // account whose registry has not been created or migrated yet — see below.
@@ -32,18 +33,21 @@ async function getUserLocations(userId) {
     // GEN-C: the same single generic site profile.service will seed on first write. It used to
     // return Guru's three, which meant a brand-new account briefly reported sites it did not own.
     const { code, label } = DEFAULT_NEW_ACCOUNT_LOCATION;
-    return { codes: [code], labels: { [code]: label }, fillingLocationCode: code, profiles: [] };
+    return { codes: [code], labels: { [code]: label }, fillingLocationCode: code,
+             maintenanceLocationCode: code, profiles: [] };
   }
 
   const codes = [];
   const labels = {};
   let fillingLocationCode = null;
+  let maintenanceLocationCode = null;
 
   for (const p of profiles) {
     if (!p.location) continue;
     codes.push(p.location);
     labels[p.location] = p.label || LOCATION_LABELS[p.location] || p.location;
     if (p.is_filling_location) fillingLocationCode = p.location;
+    if (p.is_maintenance_location) maintenanceLocationCode = p.location;
   }
 
   // Records exist but NONE carries the is_filling_location field: this account predates the
@@ -59,6 +63,17 @@ async function getUserLocations(userId) {
     fillingLocationCode = LEGACY_FILLING;
   }
 
+  // The maintenance site was introduced after the filling site, so an account that has never been
+  // migrated has the field on no record at all. Before it existed, maintenance happened at the
+  // FILLING site — so falling back to that keeps such an account behaving exactly as it did,
+  // rather than leaving it unable to flag any cylinder until the migration is run.
+  // Again "field absent", not "field false": once migrated, an explicit false everywhere means the
+  // user deliberately has no workshop, and that choice is respected.
+  const maintMigrated = profiles.some(p => p.is_maintenance_location !== undefined && p.is_maintenance_location !== null);
+  if (!maintenanceLocationCode && !maintMigrated) {
+    maintenanceLocationCode = fillingLocationCode;
+  }
+
   // Stable order: the seed sites first in their historical order, then anything added later,
   // alphabetically. Reports and dropdowns depend on a predictable order.
   codes.sort((a, b) => {
@@ -69,7 +84,7 @@ async function getUserLocations(userId) {
     return a.localeCompare(b);
   });
 
-  return { codes, labels, fillingLocationCode, profiles };
+  return { codes, labels, fillingLocationCode, maintenanceLocationCode, profiles };
 }
 
 /** Is `code` one of this user's configured locations? Blank/missing is always false. */
@@ -77,6 +92,13 @@ async function isValidLocation(userId, code) {
   if (!code || typeof code !== 'string') return false;
   const { codes } = await getUserLocations(userId);
   return codes.includes(code);
+}
+
+/** Is `code` the user's maintenance location (workshop)? False when they have none configured. */
+async function isMaintenanceLocation(userId, code) {
+  if (!code) return false;
+  const { maintenanceLocationCode } = await getUserLocations(userId);
+  return !!maintenanceLocationCode && maintenanceLocationCode === code;
 }
 
 /** Is `code` the user's filling location? False when they have none configured. */
@@ -96,4 +118,4 @@ async function labelFor(userId, code) {
   return labels[code] || LOCATION_LABELS[code] || code;
 }
 
-module.exports = { getUserLocations, isValidLocation, isFillingLocation, labelFor };
+module.exports = { getUserLocations, isValidLocation, isFillingLocation, isMaintenanceLocation, labelFor };

@@ -21,6 +21,16 @@ const businessProfileSchema = new mongoose.Schema({
   // on a challan are allowed to differ. An ordered array rather than three named fields so a
   // fourth site (F-02) needs no schema change.
   contact_lines: { type: [String], default: [] },
+  // ─── F-11: Purity Test Certificate ───
+  // The series prefix, e.g. "GI" -> "GI/TC/2026-27/1". Blank by default and blank is a valid
+  // setting: the segment is dropped entirely rather than printing a leading slash ("TC/2026-27/1").
+  // Blank, not a sensible-looking guess, for the same reason as every other GEN-A identity field —
+  // a default here would print one client's initials on another client's certificate.
+  certificate_prefix: { type: String, default: '' },
+  // The contact line printed beneath the business name in a certificate's signature block
+  // ("For / GURU Industries / <this line>"). Separate from contact_lines, which is the letterhead
+  // contact BOX at the top of the page — a certificate signs off with one line, not three.
+  footer_contact_line: { type: String, default: '' },
   // Printed logo size as a percentage of its normal size. 100 = today's appearance. The logo
   // scales on its own; letterhead text size is unaffected.
   logo_scale: { type: Number, default: 100 },

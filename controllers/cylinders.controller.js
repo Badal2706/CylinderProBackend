@@ -41,7 +41,8 @@ exports.importCylinders = asyncHandler(async (req, res) => {
 });
 
 exports.setMaintenance = asyncHandler(async (req, res) => {
-  res.json(await cylinderService.setMaintenance(req.user.id, req.params.id, !!req.body.on));
+  // active_location names the site whose manager is recorded as having done this.
+  res.json(await cylinderService.setMaintenance(req.user.id, req.params.id, !!req.body.on, req.body.active_location));
 });
 
 exports.updateCylinder = asyncHandler(async (req, res) => {

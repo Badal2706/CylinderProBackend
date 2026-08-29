@@ -30,6 +30,14 @@ const billLineItemSchema = new mongoose.Schema({
     type: String,
     default: ''   // blank for personal-cylinder-only lines (quantity-only, no inventory cylinder)
   },
+  // The site this cylinder had been ISSUED from, recorded only on a RECEIVED line where that
+  // differs from the bill's own location — i.e. a customer handed it back at a different branch.
+  // The move is real (the cylinder joins THIS site's stock) but deliberately produces no transfer
+  // document, because the RECEIVED line already accounts for the arrival; see the long note in
+  // bill.service.createBill. Without this the bill showed one location and gave the reader no clue
+  // the cylinder had come from another site — only the cylinder's own history said so.
+  // Blank on every ordinary line, and on bills saved before this field existed.
+  issued_from_location: { type: String, default: '' },
   quantity: {
     type: Number,
     default: 1

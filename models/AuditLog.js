@@ -10,12 +10,16 @@ const auditLogSchema = new mongoose.Schema({
   user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   action: {
     type: String,
-    enum: ['BILL_EDIT', 'BILL_DELETE', 'OVER_LIMIT_OVERRIDE', 'PROFILE_SAVE', 'MASTERS_CHANGE', 'TRUSTED_PEOPLE_CHANGE'],
+    enum: ['BILL_EDIT', 'BILL_DELETE', 'OVER_LIMIT_OVERRIDE', 'PROFILE_SAVE', 'MASTERS_CHANGE',
+           'TRUSTED_PEOPLE_CHANGE', 'BACKUP_TAKEN'],
     required: true
   },
   target: { type: String, default: '' },  // e.g. bill number, section name, gas type
   detail: { type: String, default: '' },
-  via: { type: String, enum: ['OTP', 'TOTP'], required: true },
+  // How the action was authorised. 'SESSION' means the logged-in session alone — no trusted
+  // person approved it. Backups moved to that in Aug 2026 on the owner's instruction; the log
+  // entry is what preserves accountability now that approval no longer gates them.
+  via: { type: String, enum: ['OTP', 'TOTP', 'SESSION'], required: true },
   person_id: { type: mongoose.Schema.Types.ObjectId, ref: 'TrustedPerson', default: null },
   person_name: { type: String, default: '' }
 }, { timestamps: true });

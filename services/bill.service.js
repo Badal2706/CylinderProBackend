@@ -10,6 +10,7 @@ const { recomputeLocationPcStock } = require('./pcStock.service');
 const { recomputeCylinderState, stateAsOf } = require('./cylinderState.service');
 const audit = require('./audit.service');
 const accountNumbering = require('./accountNumbering.service');
+const { istDayRange } = require('../utils/istDay');
 
 // Edit/Delete window (Phase 5): bills are mutable for 3 days from their CREATION timestamp
 // (createdAt — not the transaction date typed on the bill). bill_number stays editable forever.
@@ -398,10 +399,10 @@ async function listBills(userId, { date, customer_id, page, limit, search }) {
   const query = { user_id: userId, is_draft: { $ne: true } };
 
   if (date) {
-    const startDate = new Date(date);
-    const endDate = new Date(date);
-    endDate.setHours(23, 59, 59, 999);
-    query.bill_date = { $gte: startDate, $lte: endDate };
+    // The IST calendar day, not a UTC one. Bills written after midnight IST are stored with the
+    // PREVIOUS UTC date, so a UTC-midnight window dropped them from their own day (utils/istDay).
+    const { start, end } = istDayRange(date);
+    query.bill_date = { $gte: start, $lte: end };
   }
 
   if (customer_id) {
@@ -759,6 +760,8 @@ async function createBill(userId, body, stepUp = null) {
   const givenSet = new Set(givenSerials);
   const confirmPre = !!body.confirm_pre_software;
   const preSoftware = []; // cylinders whose ONLY contradiction is the Phase 33 migration placeholder
+  const confirmCrossSite = !!body.confirm_cross_site;
+  const crossSite = [];   // returned to a different site than they were issued from
 
   // The migration snapshot (Phase 33 placeholder): the cylinder's earliest software record. When no
   // genuine bill precedes the entry, this is all we can check against — and a backdated entry that
@@ -813,7 +816,27 @@ async function createBill(userId, body, stepUp = null) {
     const isOutboundRoundTrip = transaction_type === 'SWAP' && givenSet.has(s);
     if (isOutboundRoundTrip) continue;
     const { state, priorRealBills } = await stateAsOf(userId, s, asOf, null);
-    if (state.stock_state === 'AT_CUSTOMER') continue; // was out with a customer as of that date → OK
+    if (state.stock_state === 'AT_CUSTOMER') {
+      // Giving already refuses a cylinder that is in stock at another site. Receiving used to stop
+      // here, asking only "was it out with a customer?" and never "out from WHERE?" — so a cylinder
+      // issued from Palanpur could be taken back on a Chandisar bill, and on save its location was
+      // silently rewritten to the receiving site with nothing recording the move.
+      //
+      // It is allowed (customers really do return to whichever branch is nearer) but never silent:
+      // the user confirms, and the move is written to the cylinder's history.
+      if (state.location && state.location !== location) {
+        if (!confirmCrossSite) {
+          crossSite.push({
+            serial: s,
+            given_at: state.location,
+            given_at_label: locLabels[state.location] || state.location,
+            received_at: location,
+            received_at_label: locLabels[location] || location
+          });
+        }
+      }
+      continue; // was out with a customer as of that date → OK
+    }
     if (priorRealBills > 0) {
       throw new HttpError(400, `Cylinder "${s}" was already in stock as of ${fmtDT(asOf)} (per its bill history) — it wasn't out with a customer then, so it can't be received.`);
     } else {
@@ -832,6 +855,17 @@ async function createBill(userId, body, stepUp = null) {
   // Pre-software confirmation (item 4): no genuine bill precedes these entries — only the migration
   // placeholder, which they contradict. Return WITHOUT saving so the client can confirm; a genuine
   // prior bill would have hard-rejected above instead, so this can never mask real contradictions.
+  if (crossSite.length && !confirmCrossSite) {
+    const one = crossSite[0];
+    return {
+      requires_cross_site_confirmation: true,
+      cylinders: crossSite,
+      message: crossSite.length === 1
+        ? `Cylinder "${one.serial}" was given out from ${one.given_at_label}, not ${one.received_at_label}. Taking it back here moves it to ${one.received_at_label}'s stock. Confirm to record the return and the site change.`
+        : `${crossSite.length} cylinders were given out from a different site than ${one.received_at_label}. Taking them back here moves them to ${one.received_at_label}'s stock. Confirm to record the returns and the site changes.`
+    };
+  }
+
   if (preSoftware.length && !confirmPre) {
     return {
       requires_pre_software_confirmation: true,
@@ -972,10 +1006,16 @@ async function createBill(userId, body, stepUp = null) {
         return;
       }
       serials.forEach((serialNumber, idx) => {
+        // Cross-site return: cylByRot still holds the PRE-save location, so this is the site the
+        // cylinder was issued from. Recorded on the line so the bill itself can say where it came
+        // from — the confirmation the user ticks is otherwise invisible once the bill is saved.
+        const pre = cylByRot[serialNumber];
+        const issuedFrom = (pre && pre.location && pre.location !== location) ? pre.location : '';
         lineItems.push({
           direction: 'RECEIVED', gas_type_id: item.gas_type_id, cylinder_size_id: item.cylinder_size_id,
           serial_number: serialNumber, quantity: 1, rate: 0, amount: 0,
-          personalCylindersIn: idx === 0 ? pIn : 0
+          personalCylindersIn: idx === 0 ? pIn : 0,
+          issued_from_location: issuedFrom
         });
       });
     });
@@ -1119,12 +1159,23 @@ async function createBill(userId, body, stepUp = null) {
     for (const s of receivedSerials) {
       const pre = cylByRot[s];
       if (!pre) continue;
+      // A cylinder taken back at a different site than it went out from has changed hands between
+      // plants. No transfer document is written for it: the customer RECEIVED line already accounts
+      // for the physical arrival, and adding a transfer on top double-counts it (proved in
+      // scripts/expCrossSiteReturn.js — Chandisar's "Empty In" became 2 for one cylinder and drove
+      // its opening balance negative). The move is recorded HERE, in the cylinder's own history,
+      // where from_location/to_location already carry it — so it is explained without disturbing
+      // the Stock Summary or the DSR.
+      const crossFrom = (pre.location && pre.location !== location) ? pre.location : '';
+      const crossNote = crossFrom
+        ? ` — returned to ${locLabel}, having been issued from ${locLabels[crossFrom] || crossFrom}`
+        : '';
       events.push({
         user_id: userId, cylinder_id: pre._id, rotational_number: s,
         event_type: 'RECEIVED',
-        description: isVendor
+        description: (isVendor
           ? `Received filled from ${custName || 'vendor'} at ${locLabel}`
-          : `Received empty from ${custName || 'customer'} at ${locLabel}`,
+          : `Received empty from ${custName || 'customer'} at ${locLabel}`) + crossNote,
         from_location: pre.location, to_location: location,
         from_state: pre.stock_state, to_state: 'IN_STOCK',
         customer_name: custName, document_ref: bill.bill_number,
@@ -1808,15 +1859,13 @@ async function listDrafts(userId, location) {
 }
 
 async function getTodayStats(userId) {
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-  const endOfDay = new Date();
-  endOfDay.setHours(23, 59, 59, 999);
+  // "Today" is today in India, whatever timezone this process runs in.
+  const { start, end } = istDayRange();
 
   const count = await Bill.countDocuments({
     user_id: userId,
     is_draft: { $ne: true },
-    bill_date: { $gte: startOfDay, $lte: endOfDay }
+    bill_date: { $gte: start, $lte: end }
   });
 
   return { today_transactions: count };

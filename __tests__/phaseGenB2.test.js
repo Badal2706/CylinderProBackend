@@ -98,16 +98,20 @@ describe('moving the filling flag', () => {
     expect((await locationService.getUserLocations(uid)).fillingLocationCode).toBe(PA);
   });
 
-  test('the anchor really moves — the maintenance gate follows it', async () => {
+  // Subject changed from the maintenance toggle to the gas/size edit gate: maintenance is no
+  // longer anchored to the filling site, so it can no longer witness the anchor moving. The
+  // type-edit gate still is anchored, and proves the same thing.
+  test('the anchor really moves — the gas/size edit gate follows it', async () => {
     const a = await cylSvc.createCylinder(uid, {
       rotational_number: 'B2-M1', gas_type: 'Oxygen', capacity: '7 m3', location: PA, stock_state: 'IN_STOCK'
     });
-    await expect(cylSvc.setMaintenance(uid, String(a.cylinder_id), true)).resolves.toBeDefined();
+    await expect(cylSvc.updateCylinder(uid, String(a.cylinder_id), { capacity: '10 m3' }))
+      .resolves.toBeDefined();
 
     const b = await cylSvc.createCylinder(uid, {
       rotational_number: 'B2-M2', gas_type: 'Oxygen', capacity: '7 m3', location: CH, stock_state: 'IN_STOCK'
     });
-    await expect(cylSvc.setMaintenance(uid, String(b.cylinder_id), true))
+    await expect(cylSvc.updateCylinder(uid, String(b.cylinder_id), { capacity: '10 m3' }))
       .rejects.toThrow(/Palanpur Office/);
   });
 

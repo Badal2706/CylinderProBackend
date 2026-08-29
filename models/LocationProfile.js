@@ -26,6 +26,12 @@ const locationProfileSchema = new mongoose.Schema({
   // gate, and filling-log entries. A user may have none, in which case those rules have no anchor
   // and transfers stay flagged/unclassified — the same path Palanpur↔Chhapi already took.
   is_filling_location: { type: Boolean, default: false },
+  // The site that services faulty cylinders — the workshop. At most ONE per user (partial unique
+  // index below), designated exactly like the filling site and independent of it: a business may
+  // repair cylinders at the plant, or at a separate yard that does no filling at all. Only
+  // cylinders standing at THIS site can be put under maintenance, so the flag never has to move a
+  // cylinder — which is what keeps it out of the Stock Summary's ledgers entirely.
+  is_maintenance_location: { type: Boolean, default: false },
   manager_name: { type: String, default: '', trim: true },
   contact_number: { type: String, default: '', trim: true },
   // Locked challan prefix for bills at this site (e.g. "C-", "P-", "CHHAPI-").
@@ -50,6 +56,12 @@ locationProfileSchema.index({ user_id: 1, location: 1 }, { unique: true });
 locationProfileSchema.index(
   { user_id: 1, is_filling_location: 1 },
   { unique: true, partialFilterExpression: { is_filling_location: true } }
+);
+
+// Same rule, same enforcement, for the maintenance site.
+locationProfileSchema.index(
+  { user_id: 1, is_maintenance_location: 1 },
+  { unique: true, partialFilterExpression: { is_maintenance_location: true } }
 );
 
 module.exports = mongoose.model('LocationProfile', locationProfileSchema);

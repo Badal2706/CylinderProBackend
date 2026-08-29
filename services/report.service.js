@@ -5,6 +5,7 @@ const Payment = require('../models/Payment');
 const Cylinder = require('../models/Cylinder');
 const LocationProfile = require('../models/LocationProfile');
 const HttpError = require('../utils/HttpError');
+const { istDayRange, istRange, istDayString } = require('../utils/istDay');
 const { computeHoldings } = require('./holdings.service');
 const locationService = require('./location.service');
 const { getPcStock } = require('./pcStock.service');
@@ -88,9 +89,8 @@ async function getDailyReport(userId, date) {
     throw new HttpError(400, 'Date parameter is required');
   }
 
-  const startDate = new Date(date);
-  const endDate = new Date(date);
-  endDate.setHours(23, 59, 59, 999);
+  // The IST calendar day (utils/istDay) — not a UTC day, and not the server's local day.
+  const { start: startDate, end: endDate } = istDayRange(date);
 
   const bills = await Bill.find({
     user_id: userId,
@@ -203,9 +203,8 @@ async function getCustomerStatement(userId, customerId, startDateStr, endDateStr
   const paymentQuery = { customer_id: customerId, user_id: userId };
 
   if (startDateStr && endDateStr) {
-    const startDate = new Date(startDateStr);
-    const endDate = new Date(endDateStr);
-    endDate.setHours(23, 59, 59, 999);
+    // Whole IST calendar days at both ends (utils/istDay).
+    const { start: startDate, end: endDate } = istRange(startDateStr, endDateStr);
 
     billQuery.bill_date = { $gte: startDate, $lte: endDate };
     paymentQuery.date = { $gte: startDate, $lte: endDate };
@@ -213,7 +212,9 @@ async function getCustomerStatement(userId, customerId, startDateStr, endDateStr
 
   const [bills, payments] = await Promise.all([
     Bill.find(billQuery, { bill_date: 1, bill_number: 1, transaction_type: 1, total_bill_amount: 1, remarks: 1 }).lean(),
-    Payment.find(paymentQuery, { date: 1, receipt_number: 1, payment_mode: 1, amount_received: 1, remarks: 1 }).lean()
+    // `discount` must be projected: the statement credits cash + discount, and without this field
+    // the discount silently reads as undefined and the credit quietly falls back to cash alone.
+    Payment.find(paymentQuery, { date: 1, receipt_number: 1, payment_mode: 1, amount_received: 1, discount: 1, remarks: 1 }).lean()
   ]);
 
   const statement = [];
@@ -237,8 +238,10 @@ async function getCustomerStatement(userId, customerId, startDateStr, endDateStr
       payment_mode: payment.payment_mode,
       type: 'PAYMENT',
       debit: 0,
-      // Phase 14: a payment settles its gross amount_received (= net + discount).
-      credit: payment.amount_received,
+      // A payment settles cash + discount, because a discount reduces the balance exactly like
+      // cash does. This must stay in step with current_bill_amount in customer.service.js, or the
+      // statement ledger and the customer-detail balance disagree by the discount total.
+      credit: (payment.amount_received || 0) + (payment.discount || 0),
       remarks: payment.remarks
     });
   });
@@ -253,9 +256,9 @@ async function getCustomerStatement(userId, customerId, startDateStr, endDateStr
 // location omitted / 'ALL' → all sites; otherwise that site's CUSTOMER bills only.
 // reporting_person auto-fills from the site's LocationProfile manager.
 async function getDSR(uid, { date, location }) {
-  const day = date ? new Date(date) : new Date();
-  const start = new Date(day); start.setHours(0, 0, 0, 0);
-  const end = new Date(day); end.setHours(23, 59, 59, 999);
+  // The IST calendar day (utils/istDay). This used to depend on the server's timezone: right on
+  // a machine set to IST, silently shifted by 5.5 hours on one set to UTC.
+  const { start, end } = istDayRange(date);
 
   // GEN-B1: validity comes from the user's registry, not a static array.
   const { codes, labels, fillingLocationCode } = await locationService.getUserLocations(uid);
@@ -433,11 +436,9 @@ async function getStockSummary(uid, { date, location }) {
   const isFillingLoc = isF(location);
   const FillingLogEntry = require('../models/FillingLogEntry');
 
-  const day = date ? new Date(date) : new Date();
-  const start = new Date(day); start.setHours(0, 0, 0, 0);
-  const end = new Date(day); end.setHours(23, 59, 59, 999);
-  const y = start.getFullYear(), mo = String(start.getMonth() + 1).padStart(2, '0'), d = String(start.getDate()).padStart(2, '0');
-  const dayStr = `${y}-${mo}-${d}`; // filling-log dates are 'YYYY-MM-DD' strings
+  // The IST calendar day (utils/istDay). dayStr must be derived the same way — reading it back
+  // off the host clock would disagree with the window on any non-IST server.
+  const { start, end, dayStr } = istDayRange(date); // filling-log dates are 'YYYY-MM-DD' strings
 
   const [cylinders, bills, vendors, fills] = await Promise.all([
     Cylinder.find({ user_id: uid }, { rotational_number: 1, gas_type: 1, capacity: 1, location: 1, stock_state: 1 }).lean(),
@@ -473,23 +474,45 @@ async function getStockSummary(uid, { date, location }) {
   // FILLED after an on-site FILL (filling log), a transfer OUT of Chandisar (filled stock sent
   // to a sub-office), or when it has no history (fresh import assumed filled). This is the site's
   // true current stock = Closing(today).
-  const lastEvt = {}; // serial -> { t, empty }
+  const lastEvt = {};   // serial -> { t, empty }          the pool a cylinder is in NOW
+  const timeline = {};  // serial -> [{ t, empty }]        every state change, in order
   const bump = (serial, t, empty) => {
+    (timeline[serial] = timeline[serial] || []).push({ t: new Date(t), empty });
     const cur = lastEvt[serial];
     if (!cur || new Date(t) >= new Date(cur.t)) lastEvt[serial] = { t, empty };
   };
   for (const b of bills) {
+    // A FILLING VENDOR inverts the meaning of both directions (R55): we hand them EMPTIES and get
+    // FILLED cylinders back, the opposite of an ordinary customer. The movement code below has
+    // always known this; the pool assignment did not, so a cylinder returned filled by a vendor
+    // was filed as an empty while the movement counted it as filled arriving. The two then
+    // disagreed by exactly one cylinder, and the back-out turned that into filled.opening = -1.
+    const isVendorBill = b.customer_id && vendorIds.has(String(b.customer_id));
     for (const li of b.line_items) {
       if (!li.serial_number) continue;
       if (b.transaction_category === 'INTERNAL_TRANSFER') {
         if (isF(b.to_location)) bump(li.serial_number, b.bill_date, true);        // empties back to the filling site
         else if (isF(b.from_location)) bump(li.serial_number, b.bill_date, false); // filled sent out
-        // sub-office↔sub-office: leave state unchanged
+        // sub-office↔sub-office: the cylinder changes site but NOT pool — see the movement loop.
+      } else if (isVendorBill) {
+        bump(li.serial_number, b.bill_date, li.direction === 'GIVEN');   // GIVEN empty out / RECEIVED filled back
       } else {
         bump(li.serial_number, b.bill_date, li.direction === 'RECEIVED'); // returned empty vs given filled
       }
     }
   }
+  for (const s of Object.keys(timeline)) timeline[s].sort((x, y) => x.t - y.t);
+
+  // Which pool was a cylinder in at a given moment? Needed only for a transfer between two
+  // non-filling sites, where the transfer itself carries no filled/empty meaning — unlike a
+  // transfer to the plant (empties going back) or out of it (filled going out). A cylinder with
+  // no recorded history is treated as filled, matching the anchor's own assumption for imports.
+  const poolAt = (serial, t) => {
+    const evts = timeline[serial] || [];
+    let empty = false;
+    for (const e of evts) { if (e.t <= new Date(t)) empty = e.empty; else break; }
+    return empty;
+  };
   // Filling-log fills mark a cylinder filled; dated end-of-day so a same-day fill beats a same-day transfer-in.
   for (const f of fills) {
     if (!f.rotational_number) continue;
@@ -513,12 +536,24 @@ async function getStockSummary(uid, { date, location }) {
       // Only transfers with a Chandisar endpoint are classified (sub-office↔sub-office ignored).
       const touchesHereFilling = isFillingLoc && (isF(from) || isF(to));
       const touchesHereSub = !isFillingLoc && ((from === location && isF(to)) || (to === location && isF(from)));
-      if (!touchesHereFilling && !touchesHereSub) continue;
+      // A transfer between two NON-filling sites still physically moves the cylinder, so both
+      // ends must show it. It used to be skipped entirely: the destination's stock appeared from
+      // nowhere and the source's silently vanished, with the day's opening wrong at both.
+      const subToSub = !isF(from) && !isF(to) && (from === location || to === location);
+      if (!touchesHereFilling && !touchesHereSub && !subToSub) continue;
       for (const li of b.line_items) {
         if (!li.serial_number) continue; // serialized only
         const qty = li.quantity || 0; if (!qty) continue;
         const gas = stockGasKey(li.gas_type_name), cap = stockCapKey(li.size_label);
-        if (isFillingLoc) {
+        if (subToSub) {
+          // Neither end fills, so the transfer changes site without changing pool. It leaves and
+          // arrives in whichever pool the cylinder was in at that moment — asked of the timeline
+          // rather than assumed, because a sub-office can hold both filled and empty stock.
+          const wasEmpty = poolAt(li.serial_number, b.bill_date);
+          const add = wasEmpty ? addE : addF;
+          if (from === location) add(gas, cap, 'out' + bkt, qty);
+          else add(gas, cap, 'in' + bkt, qty);
+        } else if (isFillingLoc) {
           if (isF(from)) addF(gas, cap, 'out' + bkt, qty);       // filled out to a sub-office
           else if (isF(to)) addE(gas, cap, 'in' + bkt, qty);     // empties back for refill
         } else {

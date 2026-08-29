@@ -214,18 +214,71 @@ async function listCylinders(uid, { search, stock_state, location, state, page, 
 // Toggle maintenance. ON requires the cylinder to be IN_STOCK at Chandisar right now
 // (backend-enforced, not just hidden in the UI). OFF returns it to plain IN_STOCK there.
 // Never touches location/stock_state — those remain owned by the Bill post-save hook.
-async function setMaintenance(uid, id, on) {
+// ─── Manual-edit history ───
+// One place that turns a list of field changes into history rows, shared by the inventory edit
+// form and the maintenance endpoint so both read identically in a cylinder's log:
+//   "Raju bhai at Chandisar Plant changed Gas Type from Oxygen to Nitrogen"
+// "Performed by" is the acting site's Manager Name; when a site has no manager recorded the
+// sentence falls back to the site's own label, so the line always names someone or somewhere.
+async function logManualEdits(uid, cylinder, diffs, activeLocation) {
+  if (!diffs || !diffs.length) return;
+  const cylHistory = require('./cylinderHistory.service');
+  const { codes, labels } = await locationService.getUserLocations(uid);
+  const activeLoc = codes.includes(activeLocation) ? activeLocation : (codes[0] || 'AT_PLANT_CHANDISAR');
+  const mgrMap = await cylHistory.getManagerMap(uid);
+  const performer = mgrMap[activeLoc] || '';
+  const who = performer || (labels[activeLoc] || activeLoc);
+  const locLabel = labels[activeLoc] || activeLoc;
+  const now = new Date();
+  await cylHistory.logEvents(diffs.map(d => ({
+    user_id: uid, cylinder_id: cylinder._id, rotational_number: cylinder.rotational_number,
+    event_type: 'MANUAL_EDIT',
+    description: `${who} at ${locLabel} changed ${d.field} from ${d.from} to ${d.to}`,
+    from_location: d.from_location || '', to_location: d.to_location || '',
+    from_state: d.from_state || '', to_state: d.to_state || '',
+    performed_by: performer, performed_at_location: activeLoc, event_at: now
+  })));
+}
+
+// Servicing happens at ONE designated site — the workshop — chosen per account exactly like the
+// filling site (LocationProfile.is_maintenance_location) and independent of it. Two conditions,
+// each for its own reason:
+//
+//   IN_STOCK      a cylinder out with a customer is not in our hands to service, and flagging it
+//                 would drop it from that customer's holding with nothing recording a return.
+//   at the workshop  the flag must never MOVE a cylinder. Under-maintenance cylinders are still
+//                 IN_STOCK, so they sit in their site's Stock Summary anchor; relocating one on
+//                 flag would move stock between two sites with no movement in either ledger —
+//                 the exact shape of the negative-balance bugs fixed as R136/R137. Requiring the
+//                 cylinder to already BE there means the transfer is a real, documented transfer
+//                 the reports can see, and maintenance itself stays outside the ledgers entirely.
+async function assertMaintainable(uid, cylinder) {
+  if (cylinder.stock_state !== 'IN_STOCK') {
+    throw new HttpError(400,
+      'Only cylinders in stock can be put under maintenance — this one is out with a customer. ' +
+      'Receive it back first.');
+  }
+  const { maintenanceLocationCode, labels } = await locationService.getUserLocations(uid);
+  if (!maintenanceLocationCode) {
+    throw new HttpError(400,
+      'No maintenance location is set for this account. Choose one in Settings → Locations first.');
+  }
+  if (cylinder.location !== maintenanceLocationCode) {
+    const here = labels[cylinder.location] || cylinder.location;
+    const shop = labels[maintenanceLocationCode] || maintenanceLocationCode;
+    throw new HttpError(400,
+      `Cylinders are serviced at ${shop}. "${cylinder.rotational_number}" is at ${here} — ` +
+      `transfer it to ${shop} first.`);
+  }
+}
+
+async function setMaintenance(uid, id, on, activeLocation = '') {
   const cylinder = await Cylinder.findOne({ _id: id, user_id: uid });
   if (!cylinder) throw new HttpError(404, 'Cylinder not found');
 
   if (on) {
     if (cylinder.under_maintenance) throw new HttpError(400, 'Cylinder is already under maintenance');
-    // GEN-B1: anchored on the user's filling location, not a hardcoded site.
-    const { fillingLocationCode, labels } = await locationService.getUserLocations(uid);
-    const where = fillingLocationCode ? (labels[fillingLocationCode] || fillingLocationCode) : 'the filling location';
-    if (cylinder.stock_state !== 'IN_STOCK' || !fillingLocationCode || cylinder.location !== fillingLocationCode) {
-      throw new HttpError(400, `Only cylinders in stock at ${where} can be put under maintenance`);
-    }
+    await assertMaintainable(uid, cylinder);
     cylinder.under_maintenance = true;
     cylinder.maintenance_since = new Date();
   } else {
@@ -235,6 +288,17 @@ async function setMaintenance(uid, id, on) {
   }
 
   await cylinder.save();
+
+  // The dedicated maintenance endpoint logged nothing at all, so a cylinder could go in and out of
+  // maintenance with no trace. Same wording as an edit made through the inventory form.
+  try {
+    await logManualEdits(uid, cylinder, [{
+      field: 'Maintenance',
+      from: on ? 'In service' : 'Under maintenance',
+      to: on ? 'Under maintenance' : 'In service'
+    }], activeLocation);
+  } catch (e) { /* non-fatal */ }
+
   return {
     cylinder_id: cylinder._id,
     under_maintenance: cylinder.under_maintenance,
@@ -426,6 +490,15 @@ async function updateCylinder(uid, id, body) {
     }
   }
 
+  // ─── Maintenance gate ───
+  // updateCylinder accepted `under_maintenance` as a plain field, so the edit form could flag a
+  // cylinder anywhere while the dedicated endpoint refused — the same rule enforced in one place
+  // and not the other. Turning it OFF stays ungated: a cylinder already flagged must always be
+  // returnable to service, including one flagged before the workshop moved.
+  if (updates.under_maintenance === true && !before.under_maintenance) {
+    await assertMaintainable(uid, before);
+  }
+
   // ─── Gas-type / capacity edit gate (Phase 9) ───
   // Same gate as the maintenance toggle: the cylinder must be IN_STOCK at the filling location.
   // Historical bills are unaffected either way — their line items carry name snapshots.
@@ -454,11 +527,12 @@ async function updateCylinder(uid, id, body) {
 
   if (!cylinder) throw new HttpError(404, 'Cylinder not found');
 
-  // ─── Phase 33: log manual edits to location / stock_state (never via a transaction) ───
-  // Purely additive; a logging failure never fails the edit. "Performed by" resolves from the
-  // active session's location (sent by the Cylinder Inventory edit form), falling back to Chandisar.
+  // ─── Log manual edits (never via a transaction) ───
+  // Phase 33 logged Location and Stock State. Those are unchanged; Gas Type, Size and Maintenance
+  // are logged too, so a cylinder's history explains every deliberate change made to it and not
+  // just the ones that moved it. Purely additive; a logging failure never fails the edit.
   try {
-    const { codes, labels } = await locationService.getUserLocations(uid);
+    const { labels } = await locationService.getUserLocations(uid);
     const diffs = [];
     if (updates.location !== undefined && cylinder.location !== before.location) {
       diffs.push({
@@ -476,25 +550,23 @@ async function updateCylinder(uid, id, body) {
         from_state: before.stock_state, to_state: cylinder.stock_state
       });
     }
-    if (diffs.length) {
-      const cylHistory = require('./cylinderHistory.service');
-      const activeLoc = codes.includes(body.active_location)
-        ? body.active_location
-        : (codes[0] || 'AT_PLANT_CHANDISAR');
-      const mgrMap = await cylHistory.getManagerMap(uid);
-      const performer = mgrMap[activeLoc] || '';
-      const who = performer || (labels[activeLoc] || activeLoc);
-      const locLabel = labels[activeLoc] || activeLoc;
-      const now = new Date();
-      await cylHistory.logEvents(diffs.map(d => ({
-        user_id: uid, cylinder_id: cylinder._id, rotational_number: cylinder.rotational_number,
-        event_type: 'MANUAL_EDIT',
-        description: `${who} at ${locLabel} changed ${d.field} from ${d.from} to ${d.to}`,
-        from_location: d.from_location || '', to_location: d.to_location || '',
-        from_state: d.from_state || '', to_state: d.to_state || '',
-        performed_by: performer, performed_at_location: activeLoc, event_at: now
-      })));
+    // Gas Type and Size are gated to In Stock at the filling site (above), so a change here is
+    // always a deliberate re-designation of the cylinder — exactly the thing that must be on record.
+    if (updates.gas_type !== undefined && cylinder.gas_type !== before.gas_type) {
+      diffs.push({ field: 'Gas Type', from: before.gas_type || '(none)', to: cylinder.gas_type || '(none)' });
     }
+    if (updates.capacity !== undefined && cylinder.capacity !== before.capacity) {
+      diffs.push({ field: 'Size', from: before.capacity || '(none)', to: cylinder.capacity || '(none)' });
+    }
+    if (updates.under_maintenance !== undefined && !!cylinder.under_maintenance !== !!before.under_maintenance) {
+      diffs.push({
+        field: 'Maintenance',
+        from: before.under_maintenance ? 'Under maintenance' : 'In service',
+        to: cylinder.under_maintenance ? 'Under maintenance' : 'In service'
+      });
+    }
+
+    await logManualEdits(uid, cylinder, diffs, body.active_location);
   } catch (e) { /* non-fatal */ }
 
   return { cylinder_id: cylinder._id, message: 'Cylinder updated successfully' };

@@ -4,14 +4,13 @@ const Bill = require('../models/Bill');
 const Payment = require('../models/Payment');
 const Cylinder = require('../models/Cylinder');
 const { computeHoldings } = require('./holdings.service');
+const { istDayRange } = require('../utils/istDay');
 
 const toOid = (id) => new mongoose.Types.ObjectId(id);
 
 async function getStats(uid) {
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-  const endOfDay = new Date();
-  endOfDay.setHours(23, 59, 59, 999);
+  // "Today" is today in India, whatever timezone this process runs in (utils/istDay).
+  const { start: startOfDay, end: endOfDay } = istDayRange();
 
   const [billAgg, paymentAgg, customers, today_transactions] = await Promise.all([
     Bill.aggregate([

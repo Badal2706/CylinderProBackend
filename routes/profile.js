@@ -35,9 +35,19 @@ router.post('/verify-password', ctrl.verifyPassword);
 router.post('/logout-all', ctrl.logoutAll);
 router.delete('/delete-account', ctrl.deleteAccount);
 router.get('/export-data', ctrl.exportData);
-// Phase GEN-C: the disaster-recovery backup. Step-up gated because, unlike the report export
-// above, this archive is enough to reconstruct the entire account elsewhere.
-router.get('/backup', stepUpGate('Downloading a full backup'), ctrl.exportBackup);
+// Phase GEN-C: the disaster-recovery backup.
+//
+// NOT step-up gated (changed 30 Aug 2026, on the owner's explicit instruction, so that taking
+// a backup does not demand a trusted-person code every day). Be clear about what that means:
+// this archive is enough to reconstruct the entire account elsewhere, so ANY logged-in session
+// can now export every customer, bill, payment and history record in one request. The session
+// itself is the only thing standing in front of it.
+//
+// Two things deliberately did NOT change. Every backup is written to the audit log as
+// BACKUP_TAKEN / via SESSION, so it is still answerable after the fact. And RESTORE stays
+// gated below — reading the data out is now a convenience, but writing an account's contents
+// is not, and the two are not the same risk.
+router.get('/backup', ctrl.exportBackup);
 // Restore. Preview parses and validates the uploaded archive and writes NOTHING; confirm starts
 // the job and returns immediately, with progress polled from /restore/status. All three are
 // step-up gated — a restore replaces an entire account's contents.

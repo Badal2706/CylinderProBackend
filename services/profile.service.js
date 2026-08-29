@@ -60,6 +60,28 @@ async function getAccount(userId) {
 // rename but not delete (F-07). And because the check was per-location rather than
 // all-or-nothing, changing the seed list would have silently ADDED a location to every existing
 // account, including the live one.
+// ─── Has a site been put to work yet? ───
+//
+// A location's NAME is freely editable right up until the site starts being used, and frozen
+// afterwards. The reason is the same one that freezes a bill number once it is printed: the name
+// is stamped onto challans, cylinder history sentences ("Raju bhai at Chandisar Plant changed…")
+// and every report header. Renaming a site that already has records would silently rewrite what
+// those documents say happened, at a site that no longer goes by that name.
+//
+// "In use" means exactly what an operator would mean by it: a transaction has been recorded there,
+// or a cylinder is sitting there. The location CODE is permanent regardless (R83) — this is only
+// about the display name.
+async function locationUsage(userId, code) {
+  const Bill = require('../models/Bill');
+  const Cylinder = require('../models/Cylinder');
+  const [bills, cylinders] = await Promise.all([
+    Bill.countDocuments({ user_id: userId,
+      $or: [{ location: code }, { from_location: code }, { to_location: code }] }),
+    Cylinder.countDocuments({ user_id: userId, location: code })
+  ]);
+  return { bills, cylinders, in_use: bills > 0 || cylinders > 0 };
+}
+
 async function getLocationProfiles(userId) {
   const existing = await LocationProfile.find({ user_id: userId });
 
@@ -71,24 +93,33 @@ async function getLocationProfiles(userId) {
         location: DEFAULT_NEW_ACCOUNT_LOCATION.code,
         label: DEFAULT_NEW_ACCOUNT_LOCATION.label,
         // Something must fill, or DSR, Stock Summary and the filling log have no anchor.
-        is_filling_location: true
+        is_filling_location: true,
+        // …and something must service faulty cylinders, or none could ever be flagged. A one-site
+        // account is both; either can be moved independently afterwards.
+        is_maintenance_location: true
       }));
     } catch (e) { if (e.code !== 11000) throw e; }   // tolerate a race on (user_id, location)
   }
   const user = await User.findById(userId).select('active_location');
   // Ordered by the registry, not by the static array — a location added later still appears.
   const { codes, labels } = await locationService.getUserLocations(userId);
-  const profiles = codes.map(l => {
+  const profiles = await Promise.all(codes.map(async (l) => {
     const p = existing.find(x => x.location === l) || {};
+    // The UI needs to know whether the name is still editable, and WHY it is not — "3 bills" is
+    // an answer an operator can act on; a disabled box with no explanation is not.
+    const usage = await locationUsage(userId, l);
     return {
       location: l,
       label: labels[l] || l,
       is_filling_location: !!p.is_filling_location,
+      is_maintenance_location: !!p.is_maintenance_location,
       manager_name: p.manager_name || '',
       contact_number: p.contact_number || '',
-      challan_prefix: p.challan_prefix || ''
+      challan_prefix: p.challan_prefix || '',
+      renameable: !usage.in_use,
+      usage: { bills: usage.bills, cylinders: usage.cylinders }
     };
-  });
+  }));
   return {
     active_location: (user && user.active_location) || (codes[0] || 'AT_PLANT_CHANDISAR'),
     profiles
@@ -152,6 +183,51 @@ async function setFillingLocation(userId, location) {
   }
 }
 
+// The maintenance site moves by exactly the same two-write dance as the filling site, and for the
+// same reason: the partial unique index forbids the moment where two rows are flagged. Kept as a
+// separate pair rather than parameterising setFillingLocation, because the recovery path names the
+// flag it is restoring and a generic version reads worse than the duplication saves.
+async function applyMaintenanceSwap(userId, location, session) {
+  const opts = session ? { session } : {};
+  await LocationProfile.updateMany(
+    { user_id: userId, is_maintenance_location: true, location: { $ne: location } },
+    { $set: { is_maintenance_location: false } }, opts
+  );
+  await LocationProfile.updateOne(
+    { user_id: userId, location },
+    { $set: { is_maintenance_location: true } }, opts
+  );
+}
+
+async function setMaintenanceLocation(userId, location) {
+  const current = (await locationService.getUserLocations(userId)).maintenanceLocationCode;
+  if (current === location) return;
+
+  let session;
+  try {
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => { await applyMaintenanceSwap(userId, location, session); });
+    return;
+  } catch (e) {
+    if (!TX_UNSUPPORTED.test(e.message || '')) throw e;
+    console.warn('setMaintenanceLocation: transactions unavailable on this deployment — ' +
+                 'falling back to ordered writes (clear old, then set new).');
+  } finally {
+    if (session) session.endSession();
+  }
+
+  try {
+    await applyMaintenanceSwap(userId, location);
+  } catch (e) {
+    if (current) {
+      try {
+        await LocationProfile.updateOne({ user_id: userId, location: current }, { $set: { is_maintenance_location: true } });
+      } catch { /* zero maintenance locations is a legal state; the user re-picks */ }
+    }
+    throw e;
+  }
+}
+
 // Turn a human label into a permanent, unique code for this user. The code is what every Cylinder,
 // Bill and CylinderHistory row will reference forever (R83), so it is derived once at creation and
 // never regenerated when the label is later edited.
@@ -170,7 +246,7 @@ async function generateLocationCode(userId, label) {
 
 // Only manager/contact/prefix/label/filling-flag are editable — `location` identifies the record
 // and is immutable (R83).
-async function updateLocationProfile(userId, location, { manager_name, contact_number, challan_prefix, label, is_filling_location }) {
+async function updateLocationProfile(userId, location, { manager_name, contact_number, challan_prefix, label, is_filling_location, is_maintenance_location }) {
   // Validated against THIS user's registry, which is what replaces the schema enum removed in
   // GEN-B1. Seeding runs first so a brand-new account still resolves its three sites.
   await getLocationProfiles(userId);
@@ -183,6 +259,23 @@ async function updateLocationProfile(userId, location, { manager_name, contact_n
   if (label !== undefined) {
     const l = String(label).trim();
     if (!l) throw new HttpError(400, 'Location name cannot be blank');
+    // Enforced HERE, not only in the UI: a disabled input is a courtesy, the rule is the server's.
+    // Re-sending the SAME name is not a rename — the settings form posts every card on every save,
+    // so a locked site must still be able to have its manager or challan prefix edited.
+    const current = await LocationProfile.findOne({ user_id: userId, location }).select('label').lean();
+    const currentLabel = (current && current.label) || '';
+    if (l !== currentLabel) {
+      const usage = await locationUsage(userId, location);
+      if (usage.in_use) {
+        const parts = [];
+        if (usage.bills) parts.push(`${usage.bills} transaction${usage.bills === 1 ? '' : 's'}`);
+        if (usage.cylinders) parts.push(`${usage.cylinders} cylinder${usage.cylinders === 1 ? '' : 's'}`);
+        throw new HttpError(400,
+          `"${currentLabel}" cannot be renamed — it already has ${parts.join(' and ')}. ` +
+          'The name is printed on challans and written into cylinder history, so it is fixed once ' +
+          'the site is in use. Add a new location instead.');
+      }
+    }
     update.label = l;
   }
 
@@ -196,14 +289,24 @@ async function updateLocationProfile(userId, location, { manager_name, contact_n
     await LocationProfile.updateOne({ user_id: userId, location }, { $set: { is_filling_location: false } });
   }
 
+  // Same treatment for the workshop flag, for the same index reason.
+  if (is_maintenance_location === true) {
+    await setMaintenanceLocation(userId, location);
+  } else if (is_maintenance_location === false) {
+    await LocationProfile.updateOne({ user_id: userId, location }, { $set: { is_maintenance_location: false } });
+  }
+
+  // `label` is required, so an upsert must always carry one — otherwise a race that inserts here
+  // would fail validation. But it may only appear in ONE operator: naming it in both $set and
+  // $setOnInsert makes MongoDB reject the whole write with "Updating the path 'label' would create
+  // a conflict at 'label'". That made EVERY rename fail, which is why the location name looked
+  // un-editable even though the endpoint accepted the field.
+  const onInsert = { user_id: userId, location };
+  if (update.label === undefined) onInsert.label = LOCATION_LABELS[location] || location;
+
   const profile = await LocationProfile.findOneAndUpdate(
     { user_id: userId, location },
-    {
-      $set: update,
-      // `label` is required, so an upsert must always carry one — otherwise a race that inserts
-      // here would fail validation.
-      $setOnInsert: { user_id: userId, location, label: LOCATION_LABELS[location] || location }
-    },
+    { $set: update, $setOnInsert: onInsert },
     { new: true, upsert: true, setDefaultsOnInsert: true }
   );
   return {
@@ -212,6 +315,7 @@ async function updateLocationProfile(userId, location, { manager_name, contact_n
       location: profile.location,
       label: profile.label || location,
       is_filling_location: !!profile.is_filling_location,
+      is_maintenance_location: !!profile.is_maintenance_location,
       manager_name: profile.manager_name || '',
       contact_number: profile.contact_number || '',
       challan_prefix: profile.challan_prefix || ''
@@ -233,6 +337,9 @@ async function updateLocationProfilesBatch(userId, profiles) {
   if (profiles.filter(p => p.is_filling_location === true).length > 1) {
     throw new HttpError(400, 'Only one location can be the filling location');
   }
+  if (profiles.filter(p => p.is_maintenance_location === true).length > 1) {
+    throw new HttpError(400, 'Only one location can be the maintenance location');
+  }
   for (const p of profiles) {
     await updateLocationProfile(userId, p.location, p);
   }
@@ -242,7 +349,7 @@ async function updateLocationProfilesBatch(userId, profiles) {
 // Phase GEN-B2: add a site. The code is generated once and permanent; everything else is editable
 // afterwards. Creating a location changes nothing about existing cylinders, bills or reports — it
 // only makes a new value selectable.
-async function createLocationProfile(userId, { label, is_filling_location, manager_name, contact_number, challan_prefix }) {
+async function createLocationProfile(userId, { label, is_filling_location, is_maintenance_location, manager_name, contact_number, challan_prefix }) {
   const name = String(label || '').trim();
   if (!name) throw new HttpError(400, 'A location name is required');
 
@@ -262,6 +369,7 @@ async function createLocationProfile(userId, { label, is_filling_location, manag
       location: code,
       label: name,
       is_filling_location: false,          // set via the swap below, never inline
+      is_maintenance_location: false,      // ditto
       manager_name: String(manager_name || '').trim(),
       contact_number: String(contact_number || '').trim(),
       challan_prefix: String(challan_prefix || '').trim()
@@ -275,6 +383,10 @@ async function createLocationProfile(userId, { label, is_filling_location, manag
     await setFillingLocation(userId, code);
     profile.is_filling_location = true;
   }
+  if (is_maintenance_location === true) {
+    await setMaintenanceLocation(userId, code);
+    profile.is_maintenance_location = true;
+  }
 
   return {
     message: `Location "${name}" added`,
@@ -282,6 +394,7 @@ async function createLocationProfile(userId, { label, is_filling_location, manag
       location: profile.location,
       label: profile.label,
       is_filling_location: !!profile.is_filling_location,
+      is_maintenance_location: !!profile.is_maintenance_location,
       manager_name: profile.manager_name || '',
       contact_number: profile.contact_number || '',
       challan_prefix: profile.challan_prefix || ''
@@ -447,6 +560,7 @@ async function getBusinessProfile(userId) {
     profile = {
       business_name: '', business_address: '', business_phone: '', gst_number: '',
       certification_line: '', business_email: '', products_line: '', contact_lines: [],
+      certificate_prefix: '', footer_contact_line: '',
       logo_scale: 100, logo: '', fy_reset_numbering: false
     };
   }
@@ -469,6 +583,9 @@ async function getBusinessProfile(userId) {
     business_email: profile.business_email || '',
     products_line: profile.products_line || '',
     contact_lines: Array.isArray(profile.contact_lines) ? profile.contact_lines.map(String) : [],
+    // F-11
+    certificate_prefix: profile.certificate_prefix || '',
+    footer_contact_line: profile.footer_contact_line || '',
     logo_scale: Number(profile.logo_scale) > 0 ? Number(profile.logo_scale) : 100,
     logo: profile.logo || '',
     // GEN-C numbering
@@ -482,6 +599,7 @@ async function getBusinessProfile(userId) {
 async function updateBusinessProfile(userId, {
   business_name, business_address, business_phone, gst_number,
   certification_line, business_email, products_line, contact_lines, logo_scale, logo,
+  certificate_prefix, footer_contact_line,
   fy_reset_numbering
 }) {
   const update = {};
@@ -529,6 +647,11 @@ async function updateBusinessProfile(userId, {
     const n = Number(logo_scale);
     update.logo_scale = Number.isFinite(n) ? Math.min(400, Math.max(25, Math.round(n))) : 100;
   }
+  // F-11. The prefix is trimmed because it is concatenated into a document number — a trailing
+  // space would print as "GI /TC/...". The footer line is stored verbatim like every other
+  // letterhead field, so a deliberate layout survives.
+  if (certificate_prefix !== undefined) update.certificate_prefix = String(certificate_prefix == null ? '' : certificate_prefix).trim();
+  if (footer_contact_line !== undefined) update.footer_contact_line = footer_contact_line;
   if (logo !== undefined) update.logo = logo;
 
   const profile = await BusinessProfile.findOneAndUpdate(
@@ -585,9 +708,19 @@ async function deleteAccount(userId, password, stepUpToken) {
     const r = await require(`../models/${name}`).deleteMany({ user_id: userId });
     if (r.deletedCount) removed[name] = r.deletedCount;
   }
+
+  // Free the licence this account was created with, so the client can sign up again with the same
+  // number. A licence left pointing at a deleted user is permanently stuck: the unique index still
+  // counts it as taken, and nothing would ever release it. Done BEFORE the User row goes, purely
+  // so the lookup key still exists.
+  let licence_released = null;
+  try {
+    licence_released = await require('./licence.service').releaseForUser(userId);
+  } catch (e) { console.error('Licence release failed:', e.message); }
+
   await User.deleteOne({ _id: userId });
 
-  return { message: 'Your account has been deleted.', removed };
+  return { message: 'Your account has been deleted.', removed, licence_released };
 }
 
 // Streams a ZIP of xlsx files for all of the user's data directly to `res`.
@@ -647,7 +780,8 @@ async function exportData(userId, res) {
     'Challan No': p.challan_no || '',
     'Amount Received': p.amount_received || 0,
     'Discount': p.discount || 0,
-    'Net': (p.amount_received || 0) - (p.discount || 0),
+    // "Net" is the cash figure alone, matching the Payments screen and the Excel export.
+    'Net': p.amount_received || 0,
     'Mode': p.payment_mode === 'ONLINE' || p.payment_mode === 'UPI' ? 'UPI Transfer' : (p.payment_mode || ''),
     'Cheque No': p.payment_mode === 'CHEQUE' ? (p.cheque_number || '') : '',
     'UPI Txn ID': (p.payment_mode === 'UPI' || p.payment_mode === 'ONLINE') ? (p.upi_transaction_id || '') : '',
@@ -723,6 +857,7 @@ module.exports = {
   changePassword,
   getBusinessProfile,
   updateBusinessProfile,
+  locationUsage,
   getLocationProfiles,
   createLocationProfile,
   updateLocationProfile,

@@ -46,25 +46,47 @@ async function openSession(user, { remember = false, device = '', ip = '' } = {}
   return sign(user, sid, ttl);
 }
 
-// Developer token required for signup — only users with the correct token can register.
-// All signup OTPs go to this gatekeeper email for approval.
+// A LICENCE NUMBER is required for signup — issued to one email address, usable once while the
+// account it created still exists (see services/licence.service.js and models/Licence.js).
+//
+// DEVELOPER_TOKEN is the legacy scheme it replaces: one static string, no expiry, not tied to any
+// address, recorded nowhere, able to create unlimited accounts. It is still accepted as a fallback
+// so a deploy cannot lock the droplet out of signup before a licence has been issued there — the
+// licence service logs every use of it.
+//
+// All signup OTPs go to the gatekeeper email for approval.
 const DEVELOPER_TOKEN = process.env.DEVELOPER_TOKEN;
 const SIGNUP_GATEKEEPER_EMAIL = process.env.SIGNUP_GATEKEEPER_EMAIL;
 
-if (process.env.NODE_ENV === 'production' && (!DEVELOPER_TOKEN || !SIGNUP_GATEKEEPER_EMAIL)) {
-  throw new Error('DEVELOPER_TOKEN and SIGNUP_GATEKEEPER_EMAIL must be set in production');
+// SIGNUP_GATEKEEPER_EMAIL is still mandatory in production — without it no signup OTP can be
+// delivered and the flow is dead. DEVELOPER_TOKEN is NOT mandatory any more: licences replaced it,
+// and an install that has issued licences and dropped the env var is in the better state, not a
+// broken one. Its absence is worth a line in the log, not a refusal to boot.
+if (process.env.NODE_ENV === 'production' && !SIGNUP_GATEKEEPER_EMAIL) {
+  throw new Error('SIGNUP_GATEKEEPER_EMAIL must be set in production');
+}
+if (process.env.NODE_ENV === 'production' && DEVELOPER_TOKEN) {
+  console.warn('[licence] DEVELOPER_TOKEN is still set — the legacy signup fallback is active. ' +
+    'Issue licence numbers (scripts/issueLicence.js) and remove it.');
 }
 
-async function signupRequest({ name, email, password, developer_token }) {
+async function signupRequest({ name, email, password, licence_number, developer_token }) {
   if (!name || !email || !password) {
     throw new HttpError(400, 'Name, email and password are required');
   }
-  if (!developer_token || developer_token !== DEVELOPER_TOKEN) {
-    throw new HttpError(403, 'Invalid developer token');
-  }
+  // `developer_token` is still read so a browser holding an older cached bundle keeps working;
+  // both names carry the same field.
+  const submittedKey = licence_number !== undefined && licence_number !== null && String(licence_number).trim()
+    ? licence_number
+    : developer_token;
+
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw new HttpError(400, 'Please enter a valid email address');
   }
+  // Validated BEFORE the OTP is sent: a wrong licence must fail immediately rather than after a
+  // round trip through the gatekeeper's inbox. The licence is bound to the ADDRESS, so this needs
+  // the email to have been checked first.
+  await require('./licence.service').validateForSignup(submittedKey, email);
   if (password.length < 8) {
     throw new HttpError(400, 'Password must be at least 8 characters');
   }
@@ -74,9 +96,11 @@ async function signupRequest({ name, email, password, developer_token }) {
     throw new HttpError(400, 'Email is already registered');
   }
 
-  // Store pending signup data in a short-lived token and send OTP to gatekeeper.
+  // Store pending signup data in a short-lived token and send OTP to gatekeeper. The licence
+  // travels with it because the binding can only happen once the account exists, which is two
+  // requests away — and it is re-validated at that point, never trusted from here alone.
   const pendingToken = jwt.sign(
-    { name, email: email.toLowerCase(), password, purpose: 'signup' },
+    { name, email: email.toLowerCase(), password, licence_number: submittedKey, purpose: 'signup' },
     JWT_SECRET,
     { expiresIn: 600 }
   );
@@ -107,12 +131,29 @@ async function signupConfirm({ pending_token, code, remember, device, ip }) {
   const existingCheck = await User.findOne({ email: payload.email });
   if (existingCheck) throw new HttpError(400, 'Email is already registered');
 
+  // Re-validated here, not trusted from the pending token: ten minutes have passed, and the
+  // licence may have been revoked or claimed by another signup in between.
+  const licenceSvc = require('./licence.service');
+  const { legacy, licence } = await licenceSvc.validateForSignup(payload.licence_number, payload.email);
+
   const user = new User({ name: payload.name, email: payload.email, password: payload.password });
   // Phase GEN-C: derive the permanent account code NOW, from the _id Mongoose has already
   // assigned. It is immutable once saved, and every bill and receipt identity is built on it —
   // an account created without one would issue documents with a blank identity.
   user.account_code = require('./numbering.service').deriveAccountCode(user._id);
   await user.save();
+
+  // Bound AFTER the account exists and BEFORE anything else, so a licence can never be left
+  // unclaimed behind a live account. If another signup won the race, the half-created account is
+  // removed rather than left orphaned holding no licence.
+  if (!legacy) {
+    try {
+      await licenceSvc.claim(licence._id, user._id, user.email);
+    } catch (e) {
+      await User.deleteOne({ _id: user._id });
+      throw e;
+    }
+  }
 
   try {
     await require('./trustedPeople.service').createBootstrap(user._id, { name: user.name, email: user.email });

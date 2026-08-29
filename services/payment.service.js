@@ -1,5 +1,6 @@
 const Payment = require('../models/Payment');
 const Bill = require('../models/Bill');
+const Customer = require('../models/Customer');
 const HttpError = require('../utils/HttpError');
 const accountNumbering = require('./accountNumbering.service');
 
@@ -93,10 +94,27 @@ async function createPayment(userId, body) {
   };
 }
 
-async function listPayments(userId, customerId, { page, limit } = {}) {
+async function listPayments(userId, customerId, { page, limit, search } = {}) {
   const query = { user_id: userId };
   if (customerId) {
     query.customer_id = customerId;
+  }
+
+  // Search runs on the SERVER so it spans every payment, not just the batch the client happens
+  // to have loaded. The customer's name lives on the Customer document, so matching it means
+  // resolving ids first -- receipt/challan numbers match directly on the payment.
+  const term = (search || '').trim();
+  if (term) {
+    // Escape every non-alphanumeric character so a customer name containing '.' or '('
+    // is matched literally rather than as a regex.
+    const rx = new RegExp(term.replace(/[^A-Za-z0-9\s]/g, (c) => '\\' + c), 'i');
+    const custIds = await Customer.find({ user_id: userId, company_name: rx })
+      .select('_id').limit(500).lean();
+    query.$or = [
+      { receipt_number: rx },
+      { challan_no: rx },
+      ...(custIds.length ? [{ customer_id: { $in: custIds.map(c => c._id) } }] : [])
+    ];
   }
 
   const { parsePagination, paginatedResponse } = require('../utils/paginate');
@@ -106,7 +124,9 @@ async function listPayments(userId, customerId, { page, limit } = {}) {
     Payment.find(query)
       .populate('customer_id', 'company_name')
       .populate('bill_id', 'bill_number')
-      .sort('-date')
+      // Newest first by entry order, not by the user-entered date: several payments recorded on
+      // the same date must still show most-recent-first, which '-date' alone cannot do.
+      .sort('-createdAt')
       .skip(pg.skip)
       .limit(pg.limit)
       .lean(),

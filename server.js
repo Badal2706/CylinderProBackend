@@ -120,6 +120,7 @@ const rentalChargeRoutes = require('./routes/rentalCharges');
 const fillingLogRoutes = require('./routes/fillingLog');
 const trustedPeopleRoutes = require('./routes/trustedPeople');
 const stepUpRoutes = require('./routes/stepup');
+const purityCertificateRoutes = require('./routes/purityCertificates');
 
 app.use('/api/customers', customerRoutes);
 app.use('/api/bills', billRoutes);
@@ -133,6 +134,7 @@ app.use('/api/rental-charges', rentalChargeRoutes);
 app.use('/api/filling-log', fillingLogRoutes);
 app.use('/api/trusted-people', trustedPeopleRoutes);
 app.use('/api/step-up', stepUpRoutes);
+app.use('/api/purity-certificates', purityCertificateRoutes);
 
 // Error handling middleware — never leak raw stack/objects to the client.
 app.use((err, req, res, next) => {

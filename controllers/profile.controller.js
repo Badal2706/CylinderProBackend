@@ -124,6 +124,13 @@ exports.restoreStatus = asyncHandler(async (req, res) => {
 // cannot be turned into a JSON error response.
 exports.exportBackup = async (req, res) => {
   try {
+    // Recorded BEFORE the stream starts, not after: a backup that fails halfway still means the
+    // export was requested and part of the data left the server, which is the thing worth knowing.
+    await require('../services/audit.service').record({
+      userId: req.user.id, action: 'BACKUP_TAKEN', target: 'Full account backup',
+      detail: 'Downloaded without trusted-person approval (session only)',
+      stepUp: { via: 'SESSION' }
+    });
     await backupService.exportBackup(req.user.id, res);
   } catch (err) {
     logger.error(`exportBackup failed: ${err.stack || err.message}`);

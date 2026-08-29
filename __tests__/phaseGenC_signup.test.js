@@ -33,8 +33,8 @@ describe('the duplicate-email message is a contract between backend and frontend
     expect(i).toBeGreaterThan(-1);
     const block = src.slice(Math.max(0, i - 900), i);
     expect(block).toMatch(/setMode\('signin'\)/);
-    // The whole point is not retyping the address: password/name/token are cleared, email is not.
-    expect(block).toMatch(/setFormData\(f => \(\{ \.\.\.f, password: '', name: '', developer_token: '' \}\)\)/);
+    // The whole point is not retyping the address: password/name/licence are cleared, email is not.
+    expect(block).toMatch(/setFormData\(f => \(\{ \.\.\.f, password: '', name: '', licence_number: '' \}\)\)/);
     expect(block).not.toMatch(/email: ''/);
   });
 });

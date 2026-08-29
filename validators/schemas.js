@@ -81,6 +81,33 @@ const paymentCreate = z.object({
   date: optStr(40)
 }).passthrough();
 
+// F-11 Purity Test Certificate — a bounded outer guard only. Every content field is free text
+// that prints exactly as typed (see the model's comment on why purity/capacity/qty are strings),
+// so there is nothing to coerce here: only the customer is required, and the rest is
+// length-capped. The certificate NUMBER is deliberately absent — it is assigned server-side and a
+// client-supplied one is ignored.
+const purityCertificateCreate = z.object({
+  customer_id: reqStr(64, 'Customer'),
+  customer_name: optStr(200),
+  customer_address: optStr(1000),
+  date: optStr(40),
+  gas_type: optStr(80),
+  purity_percent: optStr(60),
+  sub_line: optStr(300),
+  declaration_text: optStr(2000),
+  cylinder_owner: optStr(200),
+  cylinder_water_capacity_ltrs: optStr(60),
+  qty: optStr(60),
+  filling_date: optStr(40),
+  delivery_date: optStr(40),
+  cylinder_serial_no: optStr(200),
+  challan_ref: optStr(120),
+  impurities: z.array(z.object({
+    name: optStr(120),
+    ppm_text: optStr(60)
+  }).passthrough()).max(60, 'too many impurity rows').optional().nullable()
+}).passthrough();
+
 // Business profile — includes the Phase-30 logo data-URL guard (type prefix + length cap).
 const businessProfile = z.object({
   business_name: optStr(200),
@@ -93,6 +120,10 @@ const businessProfile = z.object({
   products_line: optStr(300),
   contact_lines: z.array(z.string().max(300, 'a contact line must be 300 characters or fewer'))
     .max(20, 'too many contact lines').optional().nullable(),
+  // F-11: the certificate series prefix, and the contact line printed under the business name in
+  // a certificate's signature block. Both free text, length-bounded only.
+  certificate_prefix: optStr(20),
+  footer_contact_line: optStr(300),
   logo_scale: optNumericLike,
   // Phase GEN-C: whether the bill/receipt series restarts each 1 April. Whether the caller is
   // still ALLOWED to change it is a business rule, enforced in profile.service, not here.
@@ -146,6 +177,7 @@ module.exports = {
   cylinderCreate, cylinderUpdate,
   paymentCreate,
   businessProfile,
+  purityCertificateCreate,
   billCreate, billUpdate,
   importRows
 };

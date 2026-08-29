@@ -39,7 +39,8 @@ const cylinderSchema = new mongoose.Schema({
     default: 'IN_STOCK'
   },
   // Maintenance is an independent flag, NOT a stock_state value — it never goes through Bill.
-  // Only settable while the cylinder is IN_STOCK at AT_PLANT_CHANDISAR (service-enforced).
+  // Settable at ANY site while the cylinder is IN_STOCK (service-enforced). It does not move the
+  // cylinder: flagging a fault is not a physical movement.
   under_maintenance: {
     type: Boolean,
     default: false
