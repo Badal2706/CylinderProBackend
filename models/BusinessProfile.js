@@ -31,6 +31,32 @@ const businessProfileSchema = new mongoose.Schema({
   // ("For / GURU Industries / <this line>"). Separate from contact_lines, which is the letterhead
   // contact BOX at the top of the page — a certificate signs off with one line, not three.
   footer_contact_line: { type: String, default: '' },
+  // ─── Printed notes / terms block (the "નોંધ:" section at the foot of a challan) ───
+  // Free text, in whatever language and wording the business uses. Held as plain multi-line
+  // strings rather than a structured list because these are terms a proprietor edits by hand,
+  // not data anything computes with: one note per line, printed verbatim, blank lines dropped.
+  //
+  // BLANK BY DEFAULT, like every other GEN-A identity field. A default here would print one
+  // client's trading terms on another client's challan, which is worse than printing nothing.
+  // When heading, body and footer are all empty the whole block is omitted — no stray heading.
+  print_notes: {
+    // e.g. "નોંધ:" — printed above the body, omitted when blank.
+    heading: { type: String, default: '' },
+    // One note per line. Rendered as-is; a leading "*" is the user's, not ours to add.
+    body: { type: String, default: '' },
+    // Printed under the notes in bold — the English jurisdiction/inspection lines on Guru's
+    // challan live here. Separate from `body` so it can keep its own emphasis.
+    footer: { type: String, default: '' },
+    // Which printed documents carry the block. Off everywhere except the challan by default:
+    // terms belong on a delivery document, not on a status statement or a lab certificate,
+    // and silently adding them to all four would change documents nobody asked to change.
+    show_on: {
+      challan:            { type: Boolean, default: true },
+      holding_statement:  { type: Boolean, default: false },
+      purity_certificate: { type: Boolean, default: false },
+      reports:            { type: Boolean, default: false }
+    }
+  },
   // Printed logo size as a percentage of its normal size. 100 = today's appearance. The logo
   // scales on its own; letterhead text size is unaffected.
   logo_scale: { type: Number, default: 100 },

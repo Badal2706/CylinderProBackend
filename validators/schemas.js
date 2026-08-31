@@ -124,6 +124,19 @@ const businessProfile = z.object({
   // a certificate's signature block. Both free text, length-bounded only.
   certificate_prefix: optStr(20),
   footer_contact_line: optStr(300),
+  // The printed notes / terms block. Free text in any language (Gujarati, here) plus the flags
+  // for which documents carry it. Bounded only by length: it prints exactly as typed.
+  print_notes: z.object({
+    heading: optStr(120),
+    body: optStr(4000),
+    footer: optStr(1000),
+    show_on: z.object({
+      challan: z.boolean().optional().nullable(),
+      holding_statement: z.boolean().optional().nullable(),
+      purity_certificate: z.boolean().optional().nullable(),
+      reports: z.boolean().optional().nullable()
+    }).optional().nullable()
+  }).optional().nullable(),
   logo_scale: optNumericLike,
   // Phase GEN-C: whether the bill/receipt series restarts each 1 April. Whether the caller is
   // still ALLOWED to change it is a business rule, enforced in profile.service, not here.

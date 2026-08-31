@@ -118,4 +118,25 @@ async function labelFor(userId, code) {
   return labels[code] || LOCATION_LABELS[code] || code;
 }
 
-module.exports = { getUserLocations, isValidLocation, isFillingLocation, isMaintenanceLocation, labelFor };
+/**
+ * The site to assume when nobody said which one — a cylinder created with no location, a user
+ * with no active_location yet, an import row that left the column blank.
+ *
+ * This replaces a literal 'AT_PLANT_CHANDISAR' that was scattered through the services. That
+ * literal was one client's plant compiled into the application: for anybody else it named a site
+ * they do not own, so a blank location silently filed stock at a place that did not exist.
+ *
+ * The answer is the account's OWN first site, in the same stable order every dropdown and report
+ * uses. For the existing account that first site IS Chandisar, so nothing it has ever done
+ * changes; for a new account it is whatever they set up first.
+ *
+ * Returns '' for an account with no locations at all, which callers must treat as "leave it
+ * blank" rather than inventing one.
+ */
+async function defaultLocationCode(userId) {
+  const { codes } = await getUserLocations(userId);
+  return codes[0] || '';
+}
+
+module.exports = { getUserLocations, isValidLocation, isFillingLocation, isMaintenanceLocation,
+                   labelFor, defaultLocationCode };

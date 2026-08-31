@@ -45,7 +45,9 @@ async function getAccount(userId) {
     name: user.name,
     email: user.email,
     phone: user.phone || '',
-    active_location: user.active_location || 'AT_PLANT_CHANDISAR',
+    // A user who has never picked a site operates as their account's first one. Resolved from
+    // their own registry — the literal that used to sit here named one client's plant.
+    active_location: user.active_location || await locationService.defaultLocationCode(userId),
     member_since: user.createdAt,
     last_login: user.last_login || null
   };
@@ -102,7 +104,14 @@ async function getLocationProfiles(userId) {
   }
   const user = await User.findById(userId).select('active_location');
   // Ordered by the registry, not by the static array — a location added later still appears.
-  const { codes, labels } = await locationService.getUserLocations(userId);
+  // RESOLVED, not raw. getUserLocations applies the pre-migration fallbacks (an account whose
+  // records carry no is_filling_location field at all still reports its historical filling site).
+  // Reading the raw document fields here instead meant the settings screen — and now every
+  // heading and tooltip that names the filling or maintenance site — showed "none" on an account
+  // that had simply not had the GEN-B1 migration run against it yet, while the reports it feeds
+  // were using the fallback and disagreeing with it.
+  const { codes, labels, fillingLocationCode, maintenanceLocationCode } =
+    await locationService.getUserLocations(userId);
   const profiles = await Promise.all(codes.map(async (l) => {
     const p = existing.find(x => x.location === l) || {};
     // The UI needs to know whether the name is still editable, and WHY it is not — "3 bills" is
@@ -111,8 +120,8 @@ async function getLocationProfiles(userId) {
     return {
       location: l,
       label: labels[l] || l,
-      is_filling_location: !!p.is_filling_location,
-      is_maintenance_location: !!p.is_maintenance_location,
+      is_filling_location: l === fillingLocationCode,
+      is_maintenance_location: l === maintenanceLocationCode,
       manager_name: p.manager_name || '',
       contact_number: p.contact_number || '',
       challan_prefix: p.challan_prefix || '',
@@ -121,7 +130,7 @@ async function getLocationProfiles(userId) {
     };
   }));
   return {
-    active_location: (user && user.active_location) || (codes[0] || 'AT_PLANT_CHANDISAR'),
+    active_location: (user && user.active_location) || codes[0] || '',
     profiles
   };
 }
@@ -586,6 +595,19 @@ async function getBusinessProfile(userId) {
     // F-11
     certificate_prefix: profile.certificate_prefix || '',
     footer_contact_line: profile.footer_contact_line || '',
+    // Normalised on the way out so the settings form and every print path can rely on the shape
+    // existing, even for a profile saved before this field did.
+    print_notes: {
+      heading: (profile.print_notes && profile.print_notes.heading) || '',
+      body:    (profile.print_notes && profile.print_notes.body) || '',
+      footer:  (profile.print_notes && profile.print_notes.footer) || '',
+      show_on: {
+        challan:            !!(profile.print_notes && profile.print_notes.show_on && profile.print_notes.show_on.challan),
+        holding_statement:  !!(profile.print_notes && profile.print_notes.show_on && profile.print_notes.show_on.holding_statement),
+        purity_certificate: !!(profile.print_notes && profile.print_notes.show_on && profile.print_notes.show_on.purity_certificate),
+        reports:            !!(profile.print_notes && profile.print_notes.show_on && profile.print_notes.show_on.reports)
+      }
+    },
     logo_scale: Number(profile.logo_scale) > 0 ? Number(profile.logo_scale) : 100,
     logo: profile.logo || '',
     // GEN-C numbering
@@ -599,7 +621,7 @@ async function getBusinessProfile(userId) {
 async function updateBusinessProfile(userId, {
   business_name, business_address, business_phone, gst_number,
   certification_line, business_email, products_line, contact_lines, logo_scale, logo,
-  certificate_prefix, footer_contact_line,
+  certificate_prefix, footer_contact_line, print_notes,
   fy_reset_numbering
 }) {
   const update = {};
@@ -652,6 +674,26 @@ async function updateBusinessProfile(userId, {
   // letterhead field, so a deliberate layout survives.
   if (certificate_prefix !== undefined) update.certificate_prefix = String(certificate_prefix == null ? '' : certificate_prefix).trim();
   if (footer_contact_line !== undefined) update.footer_contact_line = footer_contact_line;
+
+  // Printed notes block. Written as a whole object so a partial save can never leave the flags
+  // pointing at text that has since changed. Text is stored VERBATIM apart from trimming trailing
+  // whitespace: it is Gujarati prose the proprietor typed, and "tidying" it would corrupt it.
+  if (print_notes !== undefined && print_notes !== null) {
+    const n = print_notes || {};
+    const so = n.show_on || {};
+    const cap = (v, max) => String(v == null ? '' : v).replace(/\s+$/, '').slice(0, max);
+    update.print_notes = {
+      heading: cap(n.heading, 120),
+      body:    cap(n.body, 4000),
+      footer:  cap(n.footer, 1000),
+      show_on: {
+        challan:            !!so.challan,
+        holding_statement:  !!so.holding_statement,
+        purity_certificate: !!so.purity_certificate,
+        reports:            !!so.reports
+      }
+    };
+  }
   if (logo !== undefined) update.logo = logo;
 
   const profile = await BusinessProfile.findOneAndUpdate(

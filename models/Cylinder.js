@@ -28,9 +28,12 @@ const cylinderSchema = new mongoose.Schema({
   // Phase GEN-B1: no enum — locations are per-user and live in LocationProfile. Validity is
   // checked in the service layer via location.service.isValidLocation(); a schema enum here
   // would reject any location a user adds later.
+  // No default: the schema cannot know which site an account calls its first one, and a literal
+  // here was one client's plant being written onto every other client's cylinders. The service
+  // layer resolves the blank case via location.service.defaultLocationCode().
   location: {
     type: String,
-    default: 'AT_PLANT_CHANDISAR'
+    default: ''
   },
   // Whether the cylinder is in our stock or out with a customer. Derived from Bill saves.
   stock_state: {

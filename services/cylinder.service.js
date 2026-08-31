@@ -224,7 +224,7 @@ async function logManualEdits(uid, cylinder, diffs, activeLocation) {
   if (!diffs || !diffs.length) return;
   const cylHistory = require('./cylinderHistory.service');
   const { codes, labels } = await locationService.getUserLocations(uid);
-  const activeLoc = codes.includes(activeLocation) ? activeLocation : (codes[0] || 'AT_PLANT_CHANDISAR');
+  const activeLoc = codes.includes(activeLocation) ? activeLocation : (codes[0] || '');
   const mgrMap = await cylHistory.getManagerMap(uid);
   const performer = mgrMap[activeLoc] || '';
   const who = performer || (labels[activeLoc] || activeLoc);
@@ -372,7 +372,8 @@ async function createCylinder(uid, { rotational_number, physical_number, gas_typ
     physical_number: (physical_number && physical_number.trim()) ? physical_number.trim() : undefined,
     gas_type,
     capacity,
-    location: resolvedLocation || 'AT_PLANT_CHANDISAR',
+    // Blank column → this account's own first site, never a compiled-in plant name.
+    location: resolvedLocation || await locationService.defaultLocationCode(uid),
     stock_state: normalizeStockState(stock_state) || 'IN_STOCK',
     under_maintenance: !!under_maintenance,
     maintenance_since: under_maintenance ? new Date() : null
@@ -407,6 +408,8 @@ async function importCylinders(uid, rows) {
   const seenPhy = new Set();
   // Loaded ONCE for the whole file — see matchLocation.
   const locRegistry = await locationService.getUserLocations(uid);
+  // Rows that leave the location column blank land at this account's own first site.
+  const defaultLoc = locRegistry.codes[0] || '';
 
   rows.forEach((r, i) => {
     const row = r.__row || (i + 2);
@@ -441,7 +444,7 @@ async function importCylinders(uid, rows) {
         physical_number: physical_number || undefined, // omit so the partial unique index ignores it
         gas_type: gas,
         capacity,
-        location: loc || 'AT_PLANT_CHANDISAR',
+        location: loc || defaultLoc,
         stock_state: stock || 'IN_STOCK'
       }
     });

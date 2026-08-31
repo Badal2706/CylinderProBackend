@@ -17,9 +17,12 @@ const userSchema = new mongoose.Schema({
   // Phase GEN-B1: no enum — locations are per-user and live in LocationProfile. Validity is
   // checked in the service layer via location.service.isValidLocation(); a schema enum here
   // would reject any location a user adds later.
+  // No default: which site a user "operates as" is answered from their own location registry
+  // (location.service.defaultLocationCode) the first time it is read, not by a literal here that
+  // named one client's plant for every account.
   active_location: {
     type: String,
-    default: 'AT_PLANT_CHANDISAR'
+    default: ''
   },
   last_login: { type: Date },
   // Incremented by "Log Out All Sessions" — any JWT issued with an older value is rejected.
