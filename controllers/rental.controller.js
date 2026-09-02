@@ -11,6 +11,11 @@ exports.generateRentalCharge = asyncHandler(async (req, res) => {
   res.json(await rentalService.generateRentalCharge(req.user.id, req.params.id, req.body));
 });
 
+// GET /api/customers/:id/rental-charges — this customer's past summaries, newest first.
+exports.listCustomerRentalCharges = asyncHandler(async (req, res) => {
+  res.json(await rentalService.listCustomerRentalCharges(req.user.id, req.params.id));
+});
+
 // GET /api/rental-charges/:id — saved charge with customer details (for print).
 exports.getRentalCharge = asyncHandler(async (req, res) => {
   res.json(await rentalService.getRentalCharge(req.user.id, req.params.id));

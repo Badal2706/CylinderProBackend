@@ -568,7 +568,7 @@ async function getBusinessProfile(userId) {
   if (!profile) {
     profile = {
       business_name: '', business_address: '', business_phone: '', gst_number: '',
-      certification_line: '', business_email: '', products_line: '', contact_lines: [],
+      certification_line: '', business_email: '', products_line: '', products_lines: [], contact_lines: [],
       certificate_prefix: '', footer_contact_line: '',
       logo_scale: 100, logo: '', fy_reset_numbering: false
     };
@@ -590,7 +590,13 @@ async function getBusinessProfile(userId) {
     gst_number: profile.gst_number || '',
     certification_line: profile.certification_line || '',
     business_email: profile.business_email || '',
-    products_line: profile.products_line || '',
+    // RESOLVED, not raw. An account whose migration has not run yet still has its tagline in the
+    // old single-string field; reading it here means the letterhead is already correct before the
+    // migration, and the migration only makes it explicit. Once products_lines has any entry it
+    // wins outright — including an empty array the user saved deliberately.
+    products_lines: Array.isArray(profile.products_lines) && profile.products_lines.length
+      ? profile.products_lines.map(String)
+      : (profile.products_line ? [String(profile.products_line)] : []),
     contact_lines: Array.isArray(profile.contact_lines) ? profile.contact_lines.map(String) : [],
     // F-11
     certificate_prefix: profile.certificate_prefix || '',
@@ -620,7 +626,7 @@ async function getBusinessProfile(userId) {
 
 async function updateBusinessProfile(userId, {
   business_name, business_address, business_phone, gst_number,
-  certification_line, business_email, products_line, contact_lines, logo_scale, logo,
+  certification_line, business_email, products_line, products_lines, contact_lines, logo_scale, logo,
   certificate_prefix, footer_contact_line, print_notes,
   fy_reset_numbering
 }) {
@@ -656,6 +662,13 @@ async function updateBusinessProfile(userId, {
   if (certification_line !== undefined) update.certification_line = certification_line;
   if (business_email !== undefined) update.business_email = business_email;
   if (products_line !== undefined) update.products_line = products_line;
+  // Same rule as contact_lines: trailing blanks are dropped so an empty box never prints an empty
+  // line, but a blank BETWEEN two filled lines is kept as a deliberate spacer.
+  if (products_lines !== undefined) {
+    const arr = (Array.isArray(products_lines) ? products_lines : []).map(v => String(v == null ? '' : v));
+    while (arr.length && !arr[arr.length - 1].trim()) arr.pop();
+    update.products_lines = arr;
+  }
   // Trailing blank boxes are dropped so an unused site never prints an empty line, but a blank
   // BETWEEN two filled sites is kept — that is a deliberate spacer.
   if (contact_lines !== undefined) {

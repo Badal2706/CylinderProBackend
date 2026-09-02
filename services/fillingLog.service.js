@@ -2,6 +2,7 @@ const FillingLogEntry = require('../models/FillingLogEntry');
 const Cylinder = require('../models/Cylinder');
 const HttpError = require('../utils/HttpError');
 const locationService = require('./location.service');
+const { istDayRange } = require('../utils/istDay');
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -9,10 +10,37 @@ const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 // (Phase 32 invariant) — this only records the event alongside the filling log. Non-fatal.
 // items: [{ cylinderId, rotational_number, date }] for entries that matched a real cylinder.
 async function logFillHistory(userId, items) {
-  const list = (items || []).filter(it => it && it.cylinderId);
+  let list = (items || []).filter(it => it && it.cylinderId);
   if (!list.length) return;
   try {
     const cylHistory = require('./cylinderHistory.service');
+
+    // ── ONCE PER SERIAL PER DAY ──
+    // saveDay replaces the whole day's log rows, but history is append-only. Without this, every
+    // edit re-logged FILLED for every serial still on the list, so a cylinder that survived three
+    // corrections read as having been filled three times. It was not: it was filled once and the
+    // typing was corrected twice.
+    //
+    // So a serial already carrying a FILLED event for this date is skipped. Serials REMOVED by an
+    // edit were never in `items` to begin with and are untouched either way — and nothing here
+    // deletes or rewrites an existing entry, so history already written stays exactly as it is.
+    const CylinderHistory = require('../models/CylinderHistory');
+    const byDate = new Map();
+    for (const it of list) {
+      if (!byDate.has(it.date)) byDate.set(it.date, []);
+      byDate.get(it.date).push(it.cylinderId);
+    }
+    const alreadyLogged = new Set();
+    for (const [date, ids] of byDate) {
+      const { start, end } = istDayRange(date);
+      const rows = await CylinderHistory.find({
+        user_id: userId, event_type: 'FILLED', cylinder_id: { $in: ids },
+        event_at: { $gte: start, $lte: end }
+      }).select('cylinder_id').lean();
+      rows.forEach(r => alreadyLogged.add(date + '|' + String(r.cylinder_id)));
+    }
+    list = list.filter(it => !alreadyLogged.has(it.date + '|' + String(it.cylinderId)));
+    if (!list.length) return;
     // GEN-B1: a fill happens at the user's filling location, not a hardcoded site. With none
     // configured there is nothing truthful to record, so log nothing rather than stamp every
     // fill with a site that does not fill — a mislabelled history entry is worse than none.
@@ -93,6 +121,7 @@ async function saveDay(userId, { date, entries }) {
 
   const docs = [];
   const fills = []; // Phase 33: entries that matched a real cylinder → FILLED history (log-only)
+  const seen = new Map();  // rotational_number -> { location, stock_state } for the location check
   for (let i = 0; i < entries.length; i++) {
     const raw = entries[i] || {};
     const rot = String(raw.rotational_number || '').trim();
@@ -100,7 +129,14 @@ async function saveDay(userId, { date, entries }) {
     let cap = String(raw.capacity || '').trim();
     if (rot) {
       const cyl = await Cylinder.findOne({ user_id: userId, rotational_number: rot });
-      if (cyl) { gas = cyl.gas_type; cap = cyl.capacity; fills.push({ cylinderId: cyl._id, rotational_number: rot, date }); }
+      if (cyl) {
+        gas = cyl.gas_type; cap = cyl.capacity;
+        fills.push({ cylinderId: cyl._id, rotational_number: rot, date });
+        // One entry per serial for the location check, however many times it appears in the list.
+        if (!seen.has(rot)) {
+          seen.set(rot, { rotational_number: rot, location: cyl.location, stock_state: cyl.stock_state });
+        }
+      }
     }
     if (!gas || !cap) {
       throw new HttpError(400, `Entry ${i + 1}: gas type and capacity are required (or a cylinder number that exists in inventory)`);
@@ -111,7 +147,32 @@ async function saveDay(userId, { date, entries }) {
   await FillingLogEntry.deleteMany({ user_id: userId, date });
   if (docs.length) await FillingLogEntry.insertMany(docs);
   await logFillHistory(userId, fills);
-  return listEntries(userId, date);
+  return { entries: await listEntries(userId, date), warnings: await locationWarnings(userId, [...seen.values()]) };
+}
+
+// ── Does the list match physical reality? ──
+// A cylinder can only be filled if it is standing at the filling site. Nothing checked this, so a
+// list naming a cylinder that is out with a customer — or sitting at another branch — saved in
+// silence and the day's figures quietly disagreed with the yard.
+//
+// This is a WARNING, never a block (R33): the filling list is a log of what happened, and the
+// software's picture of where a cylinder is can itself be the thing that is out of date. Staff get
+// told; they decide.
+async function locationWarnings(userId, cylinders) {
+  const { fillingLocationCode, labels } = await locationService.getUserLocations(userId);
+  if (!fillingLocationCode || !cylinders.length) return [];
+  const at = (code) => labels[code] || code || 'an unknown site';
+
+  return cylinders
+    .filter(c => c.stock_state !== 'IN_STOCK' || c.location !== fillingLocationCode)
+    .map(c => ({
+      rotational_number: c.rotational_number,
+      location: c.location,
+      stock_state: c.stock_state,
+      message: c.stock_state === 'AT_CUSTOMER'
+        ? `Cylinder ${c.rotational_number} is recorded as out with a customer, not at ${at(fillingLocationCode)}.`
+        : `Cylinder ${c.rotational_number} is recorded at ${at(c.location)}, not at ${at(fillingLocationCode)}.`
+    }));
 }
 
 async function deleteEntry(userId, entryId) {

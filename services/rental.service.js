@@ -136,4 +136,30 @@ async function getRentalCharge(uid, chargeId) {
   return data;
 }
 
-module.exports = { getCustomerAging, generateRentalCharge, getRentalCharge };
+// Every rental summary this customer has ever had generated, newest first.
+//
+// Deliberately LIGHTWEIGHT: enough to identify a summary in a list — when it was generated, what
+// it came to, and how many cylinders it covered — and nothing more. The full line items are only
+// needed when one is actually reprinted, which getRentalCharge already serves. A customer with
+// years of summaries should not ship every line item to render a dropdown.
+//
+// Scoped by user_id AND customer_id: the customer id alone comes from the URL, and on its own it
+// would let one account read another's charges by guessing an id.
+async function listCustomerRentalCharges(uid, customerId) {
+  const rows = await RentalCharge.find(
+    { user_id: uid, customer_id: customerId },
+    { generated_date: 1, total_amount: 1, free_days: 1, rate_per_day: 1, line_items: 1 }
+  ).sort({ generated_date: -1, createdAt: -1 }).lean();
+
+  return rows.map(r => ({
+    _id: String(r._id),
+    generated_date: r.generated_date,
+    total_amount: r.total_amount || 0,
+    free_days: r.free_days,
+    rate_per_day: r.rate_per_day,
+    // A count, not the items themselves.
+    line_count: Array.isArray(r.line_items) ? r.line_items.length : 0
+  }));
+}
+
+module.exports = { getCustomerAging, generateRentalCharge, getRentalCharge, listCustomerRentalCharges };

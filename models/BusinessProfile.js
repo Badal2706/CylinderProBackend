@@ -14,7 +14,15 @@ const businessProfileSchema = new mongoose.Schema({
   // EXACTLY as typed (case and line breaks preserved) and is omitted entirely when blank.
   certification_line: { type: String, default: '' },
   business_email: { type: String, default: '' },
+  // SUPERSEDED by products_lines below. Kept on the schema so an account whose migration has not
+  // run yet still has its tagline read (see profile.service's resolve-at-read fallback). Nothing
+  // writes it any more.
   products_line: { type: String, default: '' },
+  // The trading / "Mfg.:" line(s) on the letterhead. An ORDERED ARRAY rather than one string, so
+  // a business can add and remove lines freely in Settings — the same shape contact_lines already
+  // uses (R79) rather than a second idea for the same thing. Each entry prints on its own line,
+  // exactly as typed, and blank entries are dropped at print time.
+  products_lines: { type: [String], default: [] },
   // Contact box on the letterhead: one entry per block of text, printed in order, each verbatim
   // (a newline typed in the field is a newline on the page). Deliberately NOT read from
   // LocationProfile.contact_number — the number a site is administered by and the number printed

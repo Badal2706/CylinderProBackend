@@ -117,7 +117,9 @@ const businessProfile = z.object({
   // Phase GEN-A letterhead lines — free text, length-bounded only. They print exactly as typed.
   certification_line: optStr(300),
   business_email: email,
-  products_line: optStr(300),
+  products_line: optStr(300),                       // superseded by products_lines; still accepted
+  products_lines: z.array(z.string().max(300, 'a products line must be 300 characters or fewer'))
+    .max(20, 'too many products lines').optional().nullable(),
   contact_lines: z.array(z.string().max(300, 'a contact line must be 300 characters or fewer'))
     .max(20, 'too many contact lines').optional().nullable(),
   // F-11: the certificate series prefix, and the contact line printed under the business name in

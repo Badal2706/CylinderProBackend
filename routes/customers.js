@@ -22,5 +22,6 @@ router.get('/:id/payments', ctrl.getCustomerPayments);
 router.get('/:id/pc-balances', ctrl.getPcBalances);
 router.get('/:id/aging', rentalCtrl.getCustomerAging);
 router.post('/:id/rental-summary', rentalCtrl.generateRentalCharge);
+router.get('/:id/rental-charges', rentalCtrl.listCustomerRentalCharges);   // past summaries, newest first
 
 module.exports = router;
