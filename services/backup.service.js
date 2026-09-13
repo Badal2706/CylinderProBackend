@@ -1,4 +1,5 @@
 const { Readable } = require('stream');
+const mongoose = require('mongoose');
 const { EJSON } = require('bson');
 const archiverLib = require('archiver');
 const HttpError = require('../utils/HttpError');
@@ -140,6 +141,46 @@ async function buildManifest(userId) {
   };
 }
 
+// ─── Approximate download size, for the progress bar ───
+// What the browser counts is COMPRESSED bytes, so these are average zip bytes per document, per
+// collection — measured on a real account (Sep 2026: 20,800 documents -> 562 KB) and rounded UP,
+// so the bar tends to finish a little early rather than sit at 99%. A rough figure on purpose:
+// it only ever drives a percentage, and the client never shows it as a byte count.
+const EST_ZIP_BYTES_PER_DOC = {
+  locationprofiles: 130, gastypes: 40, gascapacities: 45, cylindersizes: 30, customers: 30,
+  cylinders: 16, bills: 170, payments: 50, puritycertificates: 330, rentalcharges: 170,
+  fillinglogentries: 10, cylinderhistories: 22, counters: 130, locationpcstocks: 30, auditlogs: 50
+};
+const EST_DEFAULT_BYTES_PER_DOC = 60;
+const EST_ZIP_ENTRY_OVERHEAD = 120;          // local header + central directory record per file
+// The business profile is one document whose size is almost entirely its logo — base64, which
+// barely compresses and can be anything up to 500 KB — so it is sized from the stored document
+// itself rather than from an average.
+const EST_BASE64_ZIP_RATIO = 0.75;
+const EST_PROFILE_FALLBACK_BYTES = 8000;
+
+async function estimateBackupBytes(userId, counts) {
+  let total = 2000 + EST_ZIP_ENTRY_OVERHEAD;   // manifest.json and its entry
+  for (const spec of COLLECTIONS) {
+    total += EST_ZIP_ENTRY_OVERHEAD;
+    const n = Number(counts && counts[spec.key]) || 0;
+    if (spec.key === 'businessprofiles') {
+      let bytes = EST_PROFILE_FALLBACK_BYTES * n;
+      try {
+        const [row] = await BusinessProfile.aggregate([
+          { $match: { user_id: new mongoose.Types.ObjectId(String(userId)) } },
+          { $group: { _id: null, bytes: { $sum: { $bsonSize: '$$ROOT' } } } }
+        ]);
+        if (row && row.bytes > 0) bytes = Math.round(row.bytes * EST_BASE64_ZIP_RATIO);
+      } catch { /* an older server without $bsonSize keeps the fallback */ }
+      total += bytes;
+      continue;
+    }
+    total += n * (EST_ZIP_BYTES_PER_DOC[spec.key] || EST_DEFAULT_BYTES_PER_DOC);
+  }
+  return Math.round(total);
+}
+
 // Stream the whole account to `res` as a ZIP. Nothing is buffered: the manifest is small, and
 // every collection is piped straight from its cursor into the archive.
 async function exportBackup(userId, res) {
@@ -150,6 +191,13 @@ async function exportBackup(userId, res) {
 
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename="Backup_${safeName}_${stamp}.zip"`);
+  // Headers leave with the first body byte, so the estimate is set before anything is piped. A
+  // failed estimate sends no header at all — the client then shows its plain spinner rather than a
+  // bar measured against a made-up number.
+  try {
+    const est = await estimateBackupBytes(userId, manifest.counts);
+    if (est > 0) res.setHeader('X-Estimated-Backup-Bytes', String(est));
+  } catch { /* progress display only — never a reason to fail the backup */ }
 
   const archive = createArchive({ zlib: { level: 9 } });
   archive.on('error', (err) => { res.destroy(err); });
@@ -170,6 +218,7 @@ module.exports = {
   COLLECTIONS,
   EXCLUDED,
   buildManifest,
+  estimateBackupBytes,
   countAll,
   exportBackup
 };

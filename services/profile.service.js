@@ -569,6 +569,7 @@ async function getBusinessProfile(userId) {
     profile = {
       business_name: '', business_address: '', business_phone: '', gst_number: '',
       certification_line: '', business_email: '', products_line: '', products_lines: [], contact_lines: [],
+      certificate_tagline_lines: [],
       certificate_prefix: '', footer_contact_line: '',
       logo_scale: 100, logo: '', fy_reset_numbering: false
     };
@@ -598,6 +599,11 @@ async function getBusinessProfile(userId) {
       ? profile.products_lines.map(String)
       : (profile.products_line ? [String(profile.products_line)] : []),
     contact_lines: Array.isArray(profile.contact_lines) ? profile.contact_lines.map(String) : [],
+    // Certificate-only. NO fallback to products_lines: the whole point of the field is that the two
+    // documents stop being coupled, and a fallback would couple them again for any account that
+    // leaves this blank. scripts/migrateCertificateTagline.js copies the old value across once.
+    certificate_tagline_lines: Array.isArray(profile.certificate_tagline_lines)
+      ? profile.certificate_tagline_lines.map(String) : [],
     // F-11
     certificate_prefix: profile.certificate_prefix || '',
     footer_contact_line: profile.footer_contact_line || '',
@@ -627,6 +633,7 @@ async function getBusinessProfile(userId) {
 async function updateBusinessProfile(userId, {
   business_name, business_address, business_phone, gst_number,
   certification_line, business_email, products_line, products_lines, contact_lines, logo_scale, logo,
+  certificate_tagline_lines,
   certificate_prefix, footer_contact_line, print_notes,
   fy_reset_numbering
 }) {
@@ -668,6 +675,11 @@ async function updateBusinessProfile(userId, {
     const arr = (Array.isArray(products_lines) ? products_lines : []).map(v => String(v == null ? '' : v));
     while (arr.length && !arr[arr.length - 1].trim()) arr.pop();
     update.products_lines = arr;
+  }
+  if (certificate_tagline_lines !== undefined) {
+    const arr = (Array.isArray(certificate_tagline_lines) ? certificate_tagline_lines : []).map(v => String(v == null ? '' : v));
+    while (arr.length && !arr[arr.length - 1].trim()) arr.pop();
+    update.certificate_tagline_lines = arr;
   }
   // Trailing blank boxes are dropped so an unused site never prints an empty line, but a blank
   // BETWEEN two filled sites is kept — that is a deliberate spacer.

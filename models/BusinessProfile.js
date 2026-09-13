@@ -23,6 +23,11 @@ const businessProfileSchema = new mongoose.Schema({
   // uses (R79) rather than a second idea for the same thing. Each entry prints on its own line,
   // exactly as typed, and blank entries are dropped at print time.
   products_lines: { type: [String], default: [] },
+  // The Quality Certificate's own tagline, printed on the right of its letterhead. Deliberately a
+  // SEPARATE field from products_lines: the challan and the certificate used to share one, so
+  // rewording the challan's trading line silently changed a lab certificate too. Free text, one
+  // entry per printed line, exactly as typed — the template adds no label of its own.
+  certificate_tagline_lines: { type: [String], default: [] },
   // Contact box on the letterhead: one entry per block of text, printed in order, each verbatim
   // (a newline typed in the field is a newline on the page). Deliberately NOT read from
   // LocationProfile.contact_number — the number a site is administered by and the number printed

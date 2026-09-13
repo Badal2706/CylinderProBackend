@@ -46,7 +46,11 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
-  credentials: true
+  credentials: true,
+  // Response headers a cross-origin page may read. Content-Disposition names the backup file;
+  // X-Estimated-Backup-Bytes drives the backup progress bar. Without this list the browser hides
+  // both from the page whenever the app and the API are on different origins.
+  exposedHeaders: ['Content-Disposition', 'X-Estimated-Backup-Bytes']
 }));
 
 // Phase GEN-C: the backup upload arrives as a raw .zip body, streamed straight to disk. It must

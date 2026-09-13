@@ -120,6 +120,8 @@ const businessProfile = z.object({
   products_line: optStr(300),                       // superseded by products_lines; still accepted
   products_lines: z.array(z.string().max(300, 'a products line must be 300 characters or fewer'))
     .max(20, 'too many products lines').optional().nullable(),
+  certificate_tagline_lines: z.array(z.string().max(300, 'a certificate tagline line must be 300 characters or fewer'))
+    .max(20, 'too many certificate tagline lines').optional().nullable(),
   contact_lines: z.array(z.string().max(300, 'a contact line must be 300 characters or fewer'))
     .max(20, 'too many contact lines').optional().nullable(),
   // F-11: the certificate series prefix, and the contact line printed under the business name in
