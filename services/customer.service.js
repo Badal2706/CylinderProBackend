@@ -43,40 +43,9 @@ async function getCustomerStats(customerId) {
   };
 }
 
-async function listCustomers(userId, { search, status, page, limit, include_hidden }) {
-  const query = { customer_type: 'REGULAR', user_id: userId };
-
-  // Soft-deleted customers stay out of every active list and picker. Historical bills,
-  // payments and reports look customers up by id and are unaffected by this filter.
-  //
-  // status=HIDDEN (Phase 26) is the dedicated "show hidden customers" view that the Unhide
-  // action lives on. include_hidden is compared against strings because it arrives straight
-  // off req.query — a bare truthiness check would treat "false" as true.
-  const wantHidden = status === 'HIDDEN';
-  const includeHidden = wantHidden ||
-    ['1', 'true', 'yes'].includes(String(include_hidden || '').toLowerCase());
-
-  if (wantHidden) query.is_hidden = true;
-  else if (!includeHidden) query.is_hidden = { $ne: true };
-
-  if (search) {
-    const safe = String(search).trim().slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    query.$or = [
-      { company_name: { $regex: safe, $options: 'i' } },
-      { phone_primary: { $regex: safe, $options: 'i' } },
-      { gst_number: { $regex: safe, $options: 'i' } }
-    ];
-  }
-
-  // Pre-filter by status fields that live on the Customer doc itself (avoids loading all customers).
-  if (status === 'FILLING_VENDOR') {
-    query.is_filling_vendor = true;
-  } else if (status === 'ACTIVE') {
-    query.is_active = true;
-  }
-
-  const customers = await Customer.find(query).sort('company_name').lean();
-
+// Balance, holdings and status for a list of customers — one read of their bills and payments.
+async function withCustomerStats(customers) {
+  if (!customers.length) return [];
   // Batch-compute stats using aggregation instead of N+1 queries.
   const customerIds = customers.map(c => c._id);
 
@@ -135,18 +104,63 @@ async function listCustomers(userId, { search, status, page, limit, include_hidd
     };
   });
 
-  let filtered = customersWithStats;
-  if (status === 'OVER_LIMIT') {
-    filtered = customersWithStats.filter(c => c.status === 'OVER LIMIT');
-  } else if (status === 'ZERO_BALANCE') {
-    filtered = customersWithStats.filter(c => c.current_bill_amount === 0);
+  return customersWithStats;
+}
+
+async function listCustomers(userId, { search, status, page, limit, include_hidden }) {
+  const query = { customer_type: 'REGULAR', user_id: userId };
+
+  // Soft-deleted customers stay out of every active list and picker. Historical bills,
+  // payments and reports look customers up by id and are unaffected by this filter.
+  //
+  // status=HIDDEN (Phase 26) is the dedicated "show hidden customers" view that the Unhide
+  // action lives on. include_hidden is compared against strings because it arrives straight
+  // off req.query — a bare truthiness check would treat "false" as true.
+  const wantHidden = status === 'HIDDEN';
+  const includeHidden = wantHidden ||
+    ['1', 'true', 'yes'].includes(String(include_hidden || '').toLowerCase());
+
+  if (wantHidden) query.is_hidden = true;
+  else if (!includeHidden) query.is_hidden = { $ne: true };
+
+  if (search) {
+    const safe = String(search).trim().slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    query.$or = [
+      { company_name: { $regex: safe, $options: 'i' } },
+      { phone_primary: { $regex: safe, $options: 'i' } },
+      { gst_number: { $regex: safe, $options: 'i' } }
+    ];
   }
+
+  // Pre-filter by status fields that live on the Customer doc itself (avoids loading all customers).
+  if (status === 'FILLING_VENDOR') {
+    query.is_filling_vendor = true;
+  } else if (status === 'ACTIVE') {
+    query.is_active = true;
+  }
+
+  const customers = await Customer.find(query).sort('company_name').lean();
 
   const { parsePagination, paginatedResponse } = require('../utils/paginate');
   const pg = parsePagination({ page, limit });
-  const paged = filtered.slice(pg.skip, pg.skip + pg.limit);
 
-  return paginatedResponse(paged, filtered.length, pg);
+  // OVER_LIMIT and ZERO_BALANCE are decided by the computed figures themselves, so every matching
+  // customer's stats have to exist before the page can be cut.
+  if (status === 'OVER_LIMIT' || status === 'ZERO_BALANCE') {
+    const all = await withCustomerStats(customers);
+    const filtered = status === 'OVER_LIMIT'
+      ? all.filter(c => c.status === 'OVER LIMIT')
+      : all.filter(c => c.current_bill_amount === 0);
+    return paginatedResponse(filtered.slice(pg.skip, pg.skip + pg.limit), filtered.length, pg);
+  }
+
+  // Every other view: the page is cut FIRST, and only its own customers' bills are read. A
+  // customer's figures come from that customer's bills and payments alone, so the rows are
+  // identical to computing everyone and slicing — but a 3-page load (the New Transaction picker)
+  // now reads the bill collection once in total, not once per page. On the free Atlas tier that
+  // repeated full read was the bulk of the weekly data-transfer allowance (15 Sep 2026).
+  const pageCustomers = customers.slice(pg.skip, pg.skip + pg.limit);
+  return paginatedResponse(await withCustomerStats(pageCustomers), customers.length, pg);
 }
 
 async function getCustomerDetail(userId, customerId) {

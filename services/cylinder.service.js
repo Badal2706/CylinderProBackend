@@ -315,9 +315,15 @@ async function listInRotation(uid) {
   if (!inRotation.length) return [];
 
   const serials = inRotation.map(c => c.rotational_number);
+  // Only the fields the loop below reads. It used to pull every matching bill whole — rates,
+  // amounts, challan text, edit history — about 4 MB per call on a real account, for the one
+  // question "who holds this serial". The filter, the sort and so the answer are unchanged.
   const bills = await Bill.find({
     user_id: uid,
     line_items: { $elemMatch: { direction: 'GIVEN', serial_number: { $in: serials } } }
+  }, {
+    customer_id: 1, bill_date: 1, createdAt: 1,
+    'line_items.direction': 1, 'line_items.serial_number': 1, 'line_items.returned_via': 1
   })
     .populate('customer_id', 'company_name')
     .sort('-bill_date -createdAt')
