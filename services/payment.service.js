@@ -94,11 +94,15 @@ async function createPayment(userId, body) {
   };
 }
 
-async function listPayments(userId, customerId, { page, limit, search } = {}) {
+async function listPayments(userId, customerId, { page, limit, offset, search, bill_id } = {}) {
   const query = { user_id: userId };
   if (customerId) {
     query.customer_id = customerId;
   }
+  // One bill's receipts. The transaction popup used to get this by downloading the 200 most recent
+  // payments and filtering them in the browser, which missed anything older than those 200 and
+  // shipped them to every visitor of the Transaction History screen.
+  if (bill_id) query.bill_id = bill_id;
 
   // Search runs on the SERVER so it spans every payment, not just the batch the client happens
   // to have loaded. The customer's name lives on the Customer document, so matching it means
@@ -118,7 +122,7 @@ async function listPayments(userId, customerId, { page, limit, search } = {}) {
   }
 
   const { parsePagination, paginatedResponse } = require('../utils/paginate');
-  const pg = parsePagination({ page, limit });
+  const pg = parsePagination({ page, limit, offset });
 
   const [payments, total] = await Promise.all([
     Payment.find(query)

@@ -135,13 +135,23 @@ async function createCertificate(userId, body) {
   throw new HttpError(409, 'Could not allocate a certificate number — please try again');
 }
 
-// Newest first. Certificates are few per customer, so this returns them all rather than paging:
-// the Customer Detail section shows a short list with the app's standard "View All" expansion,
-// which needs the full set in hand to search across.
-async function listCertificates(userId, { customer_id } = {}) {
+// Newest first. Paged when the caller asks (Customer Detail opens 5 and fetches 10 more per
+// click); without page/limit it still returns the plain array, capped, for any caller that wants
+// the lot.
+async function listCertificates(userId, { customer_id, page, limit, offset } = {}) {
   const query = { user_id: userId };
   if (customer_id) query.customer_id = customer_id;
-  return PurityCertificate.find(query).sort({ date: -1, createdAt: -1 }).limit(2000).lean();
+  const sort = { date: -1, createdAt: -1 };
+  if (page === undefined && limit === undefined && offset === undefined) {
+    return PurityCertificate.find(query).sort(sort).limit(2000).lean();
+  }
+  const { parsePagination, paginatedResponse } = require('../utils/paginate');
+  const pg = parsePagination({ page, limit, offset });
+  const [docs, total] = await Promise.all([
+    PurityCertificate.find(query).sort(sort).skip(pg.skip).limit(pg.limit).lean(),
+    PurityCertificate.countDocuments(query)
+  ]);
+  return paginatedResponse(docs, total, pg);
 }
 
 async function getCertificate(userId, id) {

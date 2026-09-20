@@ -49,7 +49,8 @@ async function withCustomerStats(customers) {
   // Batch-compute stats using aggregation instead of N+1 queries.
   const customerIds = customers.map(c => c._id);
 
-  const [billStats, paymentStats] = await Promise.all([
+  const balances = require('./balance.service');
+  const [billStats, money] = await Promise.all([
     Bill.find(
       { customer_id: { $in: customerIds } },
       { customer_id: 1, total_bill_amount: 1,
@@ -69,25 +70,15 @@ async function withCustomerStats(customers) {
       }
       return map;
     }),
-    Payment.aggregate([
-      { $match: { customer_id: { $in: customerIds } } },
-      { $group: {
-        _id: '$customer_id',
-        // Cash only -- the discount is applied once, via totalDiscount below.
-        totalCashReceived: { $sum: { $ifNull: ['$amount_received', 0] } },
-        totalDiscount: { $sum: { $ifNull: ['$discount', 0] } }
-      } }
-    ]).then(groups => {
-      const map = {};
-      for (const g of groups) map[String(g._id)] = g;
-      return map;
-    })
+    // Billed / received / discount — the ONE balance calculator, shared with the ledger report
+    // (services/balance.service.js). The bills above are still read for the holdings replay.
+    balances.balancesFor(customerIds.length ? customers[0].user_id : null, customerIds)
   ]);
 
   const customersWithStats = customers.map(customer => {
     const cid = String(customer._id);
     const bs = billStats[cid] || { bills: [], totalBillAmount: 0 };
-    const ps = paymentStats[cid] || { totalCashReceived: 0, totalDiscount: 0 };
+    const bal = money[cid] || balances.ZERO;
     const { held, totalGiven, totalReceived } = computeHoldings(bs.bills, { isVendor: !!customer.is_filling_vendor });
     return {
       ...customer,
@@ -95,10 +86,10 @@ async function withCustomerStats(customers) {
       total_given: totalGiven,
       total_received_qty: totalReceived,
       cylinders_held: held,
-      total_billed: bs.totalBillAmount,
-      total_received: ps.totalCashReceived,
-      total_discount: ps.totalDiscount,
-      current_bill_amount: bs.totalBillAmount - ps.totalCashReceived - ps.totalDiscount,
+      total_billed: bal.total_billed,
+      total_received: bal.total_received,
+      total_discount: bal.total_discount,
+      current_bill_amount: bal.current_bill_amount,
       status: (!customer.is_filling_vendor && held > (customer.holding_limit || 0)) ? 'OVER LIMIT' :
               customer.is_active ? 'ACTIVE' : 'INACTIVE'
     };
@@ -107,7 +98,7 @@ async function withCustomerStats(customers) {
   return customersWithStats;
 }
 
-async function listCustomers(userId, { search, status, page, limit, include_hidden }) {
+async function listCustomers(userId, { search, status, page, limit, offset, include_hidden }) {
   const query = { customer_type: 'REGULAR', user_id: userId };
 
   // Soft-deleted customers stay out of every active list and picker. Historical bills,
@@ -142,7 +133,7 @@ async function listCustomers(userId, { search, status, page, limit, include_hidd
   const customers = await Customer.find(query).sort('company_name').lean();
 
   const { parsePagination, paginatedResponse } = require('../utils/paginate');
-  const pg = parsePagination({ page, limit });
+  const pg = parsePagination({ page, limit, offset });
 
   // OVER_LIMIT and ZERO_BALANCE are decided by the computed figures themselves, so every matching
   // customer's stats have to exist before the page can be cut.
@@ -465,7 +456,7 @@ async function deleteCustomerCascade(userId, customerId) {
   };
 }
 
-async function getGivenTransactions(userId, customerId, { page, limit } = {}) {
+async function getGivenTransactions(userId, customerId, { page, limit, offset } = {}) {
   const bills = await Bill.find(
     { customer_id: customerId, user_id: userId },
     { bill_date: 1, bill_number: 1, line_items: 1 }
@@ -495,11 +486,11 @@ async function getGivenTransactions(userId, customerId, { page, limit } = {}) {
   }
 
   const { parsePagination, paginatedResponse } = require('../utils/paginate');
-  const pg = parsePagination({ page, limit });
+  const pg = parsePagination({ page, limit, offset });
   return paginatedResponse(transactions.slice(pg.skip, pg.skip + pg.limit), transactions.length, pg);
 }
 
-async function getReceivedTransactions(userId, customerId, { page, limit } = {}) {
+async function getReceivedTransactions(userId, customerId, { page, limit, offset } = {}) {
   const bills = await Bill.find(
     { customer_id: customerId, user_id: userId },
     { bill_date: 1, bill_number: 1, line_items: 1 }
@@ -526,14 +517,14 @@ async function getReceivedTransactions(userId, customerId, { page, limit } = {})
   }
 
   const { parsePagination, paginatedResponse } = require('../utils/paginate');
-  const pg = parsePagination({ page, limit });
+  const pg = parsePagination({ page, limit, offset });
   return paginatedResponse(transactions.slice(pg.skip, pg.skip + pg.limit), transactions.length, pg);
 }
 
 // Personal-cylinder history: every transaction line where personal cylinders moved
 // (personalCylindersIn > 0 OR personalCylindersOut > 0), newest first. Each row carries a
 // running "net at plant" count computed per gas-type + size combination in date order.
-async function getPersonalCylinderHistory(userId, customerId) {
+async function getPersonalCylinderHistory(userId, customerId, { page, limit, offset } = {}) {
   const bills = await Bill.find(
     { customer_id: customerId, user_id: userId },
     { bill_date: 1, bill_number: 1, challan_no: 1, line_items: 1 }
@@ -591,14 +582,16 @@ async function getPersonalCylinderHistory(userId, customerId) {
   }
 
   rows.reverse(); // most recent first
-  return rows;
+  // The running net is calculated over the FULL history first and only then paged — a page
+  // computed from a slice of bills would report the wrong net at plant (R15-R17, R57).
+  return require('../utils/paginate').pageComputed(rows, { page, limit, offset });
 }
 
-async function getCustomerPayments(userId, customerId, { page, limit } = {}) {
+async function getCustomerPayments(userId, customerId, { page, limit, offset } = {}) {
   const query = { customer_id: customerId, user_id: userId };
 
   const { parsePagination, paginatedResponse } = require('../utils/paginate');
-  const pg = parsePagination({ page, limit });
+  const pg = parsePagination({ page, limit, offset });
 
   const [payments, total] = await Promise.all([
     Payment.find(query)

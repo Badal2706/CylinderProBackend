@@ -7,6 +7,7 @@ const LocationProfile = require('../models/LocationProfile');
 const HttpError = require('../utils/HttpError');
 const { istDayRange, istRange, istDayString } = require('../utils/istDay');
 const { computeHoldings } = require('./holdings.service');
+const balanceSvc = require('./balance.service');
 const locationService = require('./location.service');
 const { getPcStock } = require('./pcStock.service');
 const toOid = (id) => new mongoose.Types.ObjectId(id);
@@ -20,7 +21,7 @@ async function getCustomerLedgerData(userId) {
 
   const customerIds = customers.map(c => c._id);
 
-  const [billsByCustomer, paymentAgg] = await Promise.all([
+  const [billsByCustomer, balances] = await Promise.all([
     Bill.find({ customer_id: { $in: customerIds }, user_id: userId },
       { customer_id: 1, total_bill_amount: 1,
         // computeHoldings reads the LATEST event per serial — it needs the ordering fields too.
@@ -28,10 +29,10 @@ async function getCustomerLedgerData(userId) {
         'line_items.direction': 1, 'line_items.quantity': 1, 'line_items.amount': 1,
         'line_items.serial_number': 1, 'line_items.gas_type_name': 1, 'line_items.size_label': 1,
         'line_items.returned_via': 1, 'line_items.returned_on_behalf_of': 1 }).lean(),
-    Payment.aggregate([
-      { $match: { customer_id: { $in: customerIds }, user_id: toOid(userId) } },
-      { $group: { _id: '$customer_id', totalPaid: { $sum: { $ifNull: ['$amount_received', 0] } } } }
-    ])
+    // The shared balance calculator (services/balance.service.js). This used to be a local sum of
+    // cash only — the discount was left out, so a customer whose balance had been settled partly by
+    // a discount still showed as owing it here while the Customers screen showed them clear.
+    balanceSvc.balancesFor(userId, customerIds)
   ]);
 
   const billMap = {};
@@ -40,15 +41,12 @@ async function getCustomerLedgerData(userId) {
     if (!billMap[cid]) billMap[cid] = [];
     billMap[cid].push(b);
   }
-  const payMap = {};
-  for (const p of paymentAgg) payMap[String(p._id)] = p.totalPaid;
 
   return customers.map(customer => {
     const cid = String(customer._id);
     const bills = billMap[cid] || [];
     const { held: cylindersHeld } = computeHoldings(bills, { isVendor: !!customer.is_filling_vendor });
-    const totalBilled = bills.reduce((sum, bill) => sum + (bill.total_bill_amount || 0), 0);
-    const totalPaid = payMap[cid] || 0;
+    const bal = balances[cid] || balanceSvc.ZERO;
 
     return {
       customer_id: customer._id,
@@ -59,7 +57,7 @@ async function getCustomerLedgerData(userId) {
       security_deposit: customer.security_deposit || 0,
       holding_limit: customer.holding_limit || 0,
       is_filling_vendor: !!customer.is_filling_vendor,
-      bill_amount: totalBilled - totalPaid,
+      bill_amount: bal.current_bill_amount,
       cylinder_hold: cylindersHeld,
       status: (!customer.is_filling_vendor && cylindersHeld > (customer.holding_limit || 0)) ? 'OVER LIMIT' : ''
     };
@@ -142,28 +140,15 @@ async function getOutstandingReport(userId) {
 
   const customerIds = customers.map(c => c._id);
 
-  const [billAgg, paymentAgg] = await Promise.all([
-    Bill.aggregate([
-      { $match: { customer_id: { $in: customerIds }, user_id: toOid(userId) } },
-      { $group: { _id: '$customer_id', totalBilled: { $sum: { $ifNull: ['$total_bill_amount', 0] } } } }
-    ]),
-    Payment.aggregate([
-      { $match: { customer_id: { $in: customerIds }, user_id: toOid(userId) } },
-      { $group: { _id: '$customer_id', totalPaid: { $sum: { $ifNull: ['$amount_received', 0] } } } }
-    ])
-  ]);
-
-  const billMap = {};
-  for (const b of billAgg) billMap[String(b._id)] = b.totalBilled;
-  const payMap = {};
-  for (const p of paymentAgg) payMap[String(p._id)] = p.totalPaid;
+  const balances = await balanceSvc.balancesFor(userId, customerIds);
 
   const outstandingData = [];
   for (const customer of customers) {
     const cid = String(customer._id);
-    const totalBilled = billMap[cid] || 0;
-    const totalPaid = payMap[cid] || 0;
-    const outstanding = totalBilled - totalPaid;
+    const bal = balances[cid] || balanceSvc.ZERO;
+    const totalBilled = bal.total_billed;
+    const totalPaid = bal.total_received;
+    const outstanding = bal.current_bill_amount;
 
     if (outstanding > 0) {
       outstandingData.push({

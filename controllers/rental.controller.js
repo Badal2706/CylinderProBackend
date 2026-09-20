@@ -3,7 +3,8 @@ const rentalService = require('../services/rental.service');
 
 // GET /api/customers/:id/aging — cylinders this customer currently holds, with days-held.
 exports.getCustomerAging = asyncHandler(async (req, res) => {
-  res.json(await rentalService.getCustomerAging(req.user.id, req.params.id));
+  // No page/limit → the whole list, which the rental calculator needs to pick cylinders from.
+  res.json(await rentalService.getCustomerAging(req.user.id, req.params.id, req.query));
 });
 
 // POST /api/customers/:id/rental-summary — generate + persist a rental charge.

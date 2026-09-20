@@ -31,7 +31,7 @@ exports.getReceivedTransactions = asyncHandler(async (req, res) => {
 });
 
 exports.getPersonalCylinderHistory = asyncHandler(async (req, res) => {
-  res.json(await customerService.getPersonalCylinderHistory(req.user.id, req.params.id));
+  res.json(await customerService.getPersonalCylinderHistory(req.user.id, req.params.id, req.query));
 });
 
 exports.getCustomerPayments = asyncHandler(async (req, res) => {

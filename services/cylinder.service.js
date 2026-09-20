@@ -57,7 +57,7 @@ function normalizeStockState(v) {
 // Cylinder Aging Report — every at-customer cylinder joined with its latest "Given" record.
 // `location` (optional) restricts to cylinders issued from that site — the days-held
 // calculation itself is untouched; this only narrows which rows are returned.
-async function getAgingReport(uid, { mode, minDays, maxDays, thresholdDays, sortBy, sortOrder, location }) {
+async function getAgingReport(uid, { mode, minDays, maxDays, thresholdDays, sortBy, sortOrder, location, search, page, limit, offset }) {
   const cylQuery = { user_id: uid, stock_state: 'AT_CUSTOMER' };
   if (location && (await locationService.isValidLocation(uid, location))) cylQuery.location = location;
   const cylinders = await Cylinder.find(cylQuery).lean();
@@ -65,9 +65,15 @@ async function getAgingReport(uid, { mode, minDays, maxDays, thresholdDays, sort
   const serials = cylinders.map(c => c.rotational_number);
   if (!serials.length) return [];
 
+  // Only the fields the loop and the rows below read (R71 — leaving one out gives wrong numbers,
+  // not an error). Whole bills cost about 4.8 MB per run of this report (20 Sep 2026).
   const bills = await Bill.find({
     user_id: uid,
     line_items: { $elemMatch: { direction: 'GIVEN', serial_number: { $in: serials } } }
+  }, {
+    customer_id: 1, bill_date: 1, createdAt: 1, bill_number: 1, challan_no: 1,
+    'line_items.direction': 1, 'line_items.serial_number': 1,
+    'line_items.returned_via': 1, 'line_items.rate': 1
   })
     .populate('customer_id', 'company_name phone_primary address')
     .sort('-bill_date -createdAt')
@@ -156,7 +162,18 @@ async function getAgingReport(uid, { mode, minDays, maxDays, thresholdDays, sort
     return (a.days_out - b.days_out) * order;
   });
 
-  return rows;
+  // Search across the WHOLE report, not the page on screen: serial, gas, size, site, customer,
+  // bill and challan. Applied after the rows are built (the customer name only exists here) and
+  // before paging, so a search always looks at every row.
+  const q = String(search == null ? '' : search).trim().toLowerCase();
+  if (q) {
+    rows = rows.filter(r => [r.rotational_number, r.gas_type, r.capacity, r.location,
+      r.customer_name, r.bill_number, r.challan_no]
+      .some(v => String(v == null ? '' : v).toLowerCase().includes(q)));
+  }
+
+  // No page/limit (Excel export, printing) still returns the plain array.
+  return require('../utils/paginate').pageComputed(rows, { page, limit, offset });
 }
 
 // Rotational numbers are plain numbers ("1", "2", "100"), so listings must sort numerically
@@ -176,7 +193,7 @@ function stateClause(s) {
   return null;
 }
 
-async function listCylinders(uid, { search, stock_state, location, state, page, limit }) {
+async function listCylinders(uid, { search, stock_state, location, state, page, limit, offset }) {
   const query = { user_id: uid };
   const and = [];
 
@@ -201,7 +218,7 @@ async function listCylinders(uid, { search, stock_state, location, state, page, 
   if (and.length) query.$and = and;
 
   const { parsePagination, paginatedResponse } = require('../utils/paginate');
-  const pg = parsePagination({ page, limit });
+  const pg = parsePagination({ page, limit, offset });
 
   const [docs, total] = await Promise.all([
     Cylinder.find(query).collation(NATURAL).sort('rotational_number').skip(pg.skip).limit(pg.limit).lean(),

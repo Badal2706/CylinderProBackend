@@ -395,7 +395,7 @@ async function validateCylinder(uid, { cylinderNo, direction, transactionId, cus
   return { valid: true };
 }
 
-async function listBills(userId, { date, customer_id, page, limit, search }) {
+async function listBills(userId, { date, customer_id, page, limit, offset, search }) {
   const query = { user_id: userId, is_draft: { $ne: true } };
 
   if (date) {
@@ -428,7 +428,7 @@ async function listBills(userId, { date, customer_id, page, limit, search }) {
   }
 
   const { parsePagination, paginatedResponse } = require('../utils/paginate');
-  const pg = parsePagination({ page, limit });
+  const pg = parsePagination({ page, limit, offset });
 
   const [bills, total] = await Promise.all([
     Bill.find(query)

@@ -11,11 +11,19 @@ const daysBetween = (from, to) => Math.max(0, Math.floor((to - new Date(from).ge
 // issuing location. Holder resolution matches the global aging report: the most recent GIVEN
 // line (not yet returned) per rotational number determines the current holder — so cylinders
 // returned on this customer's behalf by someone else are correctly excluded.
-async function getCustomerAging(uid, customerId) {
+async function getCustomerAging(uid, customerId, { page, limit, offset } = {}) {
   const customer = await Customer.findOne({ _id: customerId, user_id: uid });
   if (!customer) throw new HttpError(404, 'Customer not found');
 
-  const bills = await Bill.find({ user_id: uid }).sort('-bill_date -createdAt');
+  // Only the fields the loop below reads (R71 — a missing one here produces wrong numbers, not an
+  // error). Reading whole bills cost 7.9 MB to answer with five rows, which is why this screen and
+  // the rental calculator both felt slow (20 Sep 2026).
+  const bills = await Bill.find(
+    { user_id: uid },
+    { customer_id: 1, bill_date: 1, createdAt: 1, bill_number: 1,
+      'line_items.direction': 1, 'line_items.serial_number': 1,
+      'line_items.returned_via': 1, 'line_items.rate': 1 }
+  ).sort('-bill_date -createdAt').lean();
 
   // Latest unreturned GIVEN line per rotational number (across ALL customers).
   const latestGiven = {};
@@ -27,7 +35,10 @@ async function getCustomerAging(uid, customerId) {
     }
   }
 
-  const cylinders = await Cylinder.find({ user_id: uid, stock_state: 'AT_CUSTOMER' });
+  const cylinders = await Cylinder.find(
+    { user_id: uid, stock_state: 'AT_CUSTOMER' },
+    { rotational_number: 1, physical_number: 1, gas_type: 1, capacity: 1, location: 1, rental_charged_through: 1 }
+  ).lean();
   const now = Date.now();
   const rows = [];
 
@@ -60,7 +71,9 @@ async function getCustomerAging(uid, customerId) {
   }
 
   rows.sort((a, b) => b.days_held - a.days_held);
-  return rows;
+  // Paged only when asked. The rental calculator passes nothing and gets the whole list, which it
+  // needs: days_unbilled is computed per cylinder over its full holding, never from a page.
+  return require('../utils/paginate').pageComputed(rows, { page, limit, offset });
 }
 
 // Generate + persist a rental charge for the selected cylinders.

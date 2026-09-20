@@ -3,6 +3,7 @@ const cylinderService = require('../services/cylinder.service');
 const cylinderHistoryService = require('../services/cylinderHistory.service');
 
 exports.getAgingReport = asyncHandler(async (req, res) => {
+  // req.query carries the filters plus, when the screen is paging, search/page/limit.
   res.json(await cylinderService.getAgingReport(req.user.id, req.query));
 });
 

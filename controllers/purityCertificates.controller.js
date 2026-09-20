@@ -5,7 +5,9 @@ const service = require('../services/purityCertificate.service');
 // immutable once issued (models/PurityCertificate.js refuses the write regardless).
 
 exports.listCertificates = asyncHandler(async (req, res) => {
-  res.json(await service.listCertificates(req.user.id, { customer_id: req.query.customer_id }));
+  res.json(await service.listCertificates(req.user.id, {
+    customer_id: req.query.customer_id, page: req.query.page, limit: req.query.limit, offset: req.query.offset
+  }));
 });
 
 exports.getCertificate = asyncHandler(async (req, res) => {
