@@ -524,6 +524,16 @@ async function confirmEmailChange(userId, { pending_token, code }) {
     .syncBootstrap(userId, { name: user.name, email: user.email, verified: true });
   await user.save();
 
+  // The licence this account was created with names the address it may create an account for. Keep
+  // it on the address now in use, or a deleted account could only be re-created at the OLD one.
+  // history[] keeps the address each binding was made under. A failure here must not undo a verified
+  // email change — it is logged, and the licence keeps its previous address.
+  try {
+    await require('./licence.service').syncEmailForUser(userId, user.email);
+  } catch (e) {
+    console.error('Licence email sync after email change failed:', e.message);
+  }
+
   let totp_rotation = null;
   try {
     totp_rotation = await require('./totp.service')

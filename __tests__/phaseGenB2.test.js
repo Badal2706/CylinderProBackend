@@ -79,8 +79,8 @@ describe('creating a location', () => {
   test('a cylinder can be created at the new location', async () => {
     const GasType = require('../models/GasType');
     const CylinderSize = require('../models/CylinderSize');
-    await GasType.findOne({ gas_type_name: 'Oxygen' }) || await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-    await CylinderSize.findOne({ size_label: '7 m3' }) || await CylinderSize.create({ size_label: '7 m3', is_active: true });
+    await GasType.findOne({ user_id: uid, gas_type_name: 'Oxygen' }) || await GasType.create({ user_id: uid, gas_type_name: 'Oxygen', is_active: true });
+    await CylinderSize.findOne({ user_id: uid, size_label: '7 m3' }) || await CylinderSize.create({ user_id: uid, size_label: '7 m3', is_active: true });
     const c = await cylSvc.createCylinder(uid, {
       rotational_number: 'B2-1', gas_type: 'Oxygen', capacity: '7 m3', location: 'AT_DEESA_DEPOT', stock_state: 'IN_STOCK'
     });

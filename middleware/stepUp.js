@@ -1,4 +1,4 @@
-const { requireStepUp, tryStepUp } = require('../services/stepup.service');
+const { requireStepUp } = require('../services/stepup.service');
 
 // Phase 18 gate middleware. Reads the step-up token from the x-step-up-token header (or
 // step_up_token in the body) and attaches the verified payload as req.stepUp.
@@ -21,18 +21,4 @@ function stepUpGate(label) {
 
 const requireStepUpAuth = stepUpGate('Saving this change');
 
-// For the deliberately-unauthenticated masters routes: any user's valid step-up token
-// authorizes the change (the token itself proves a trusted person approved); the token's
-// own user id is used for the audit record.
-function requireStepUpAny(req, res, next) {
-  try {
-    const p = tryStepUp(null, req.headers['x-step-up-token'] || (req.body && req.body.step_up_token));
-    if (!p) return res.status(403).json({ error: 'Changing the gas/size catalogs requires approval — verify with a trusted person first.', code: 'STEP_UP_REQUIRED' });
-    req.stepUp = p;
-    next();
-  } catch (e) {
-    res.status(e.status || 403).json({ error: e.message, code: 'STEP_UP_REQUIRED' });
-  }
-}
-
-module.exports = { requireStepUpAuth, requireStepUpAny, stepUpGate };
+module.exports = { requireStepUpAuth, stepUpGate };

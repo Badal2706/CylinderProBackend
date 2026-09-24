@@ -530,8 +530,11 @@ async function createInternalTransfer(userId, body) {
     }
   }
 
-  // Resolve gas/size master ids from each cylinder's gas_type/capacity strings (line items require them).
-  const [gasDocs, sizeDocs] = await Promise.all([GasType.find({}), CylinderSize.find({})]);
+  // Resolve gas/size master ids from each cylinder's gas_type/capacity strings (line items require
+  // them) -- from this account's own catalog. Every account has an "Oxygen"; only its own is right.
+  const [gasDocs, sizeDocs] = await Promise.all([
+    GasType.find({ user_id: userId }), CylinderSize.find({ user_id: userId })
+  ]);
   const gasIdByName = {}; gasDocs.forEach(g => { gasIdByName[g.gas_type_name] = g._id; });
   const sizeIdByLabel = {}; sizeDocs.forEach(s => { sizeIdByLabel[s.size_label] = s._id; });
 
@@ -728,9 +731,11 @@ async function createBill(userId, body, stepUp = null) {
   // Existence is already enforced above, so every serial maps to a real cylinder here.
   const gasIds = [...new Set(allItems.map(i => String(i.gas_type_id)).filter(Boolean))];
   const sizeIds = [...new Set(allItems.map(i => String(i.cylinder_size_id)).filter(Boolean))];
+  // The ids come from the request body, so they are resolved against THIS account's catalog only
+  // -- another account's gas type id resolves to nothing, exactly like an unknown one.
   const [gasDocs, sizeDocs] = await Promise.all([
-    GasType.find({ _id: { $in: gasIds } }),
-    CylinderSize.find({ _id: { $in: sizeIds } })
+    GasType.find({ _id: { $in: gasIds }, user_id: userId }),
+    CylinderSize.find({ _id: { $in: sizeIds }, user_id: userId })
   ]);
   const gasNameById = {}; gasDocs.forEach(g => { gasNameById[String(g._id)] = g.gas_type_name; });
   const sizeLabelById = {}; sizeDocs.forEach(s => { sizeLabelById[String(s._id)] = s.size_label; });
@@ -1309,7 +1314,10 @@ async function updateInternalTransfer(user, bill, body, stepUp = null) {
       }
     }
 
-    const [gasDocs, sizeDocs] = await Promise.all([GasType.find({}), CylinderSize.find({})]);
+    // This account's own catalog (see createInternalTransfer).
+    const [gasDocs, sizeDocs] = await Promise.all([
+      GasType.find({ user_id: uid }), CylinderSize.find({ user_id: uid })
+    ]);
     const gasIdByName = {}; gasDocs.forEach(x => { gasIdByName[x.gas_type_name] = x._id; });
     const sizeIdByLabel = {}; sizeDocs.forEach(x => { sizeIdByLabel[x.size_label] = x._id; });
     const gasNameById = {}; gasDocs.forEach(x => { gasNameById[String(x._id)] = x.gas_type_name; });
@@ -1487,8 +1495,8 @@ async function updateBill(user, billId, body, stepUp = null) {
   const allGasIds = [...new Set([...bill.line_items.map(l => String(l.gas_type_id)), ...reqLines.map(l => String(l.gas_type_id))].filter(Boolean))];
   const allSizeIds = [...new Set([...bill.line_items.map(l => String(l.cylinder_size_id)), ...reqLines.map(l => String(l.cylinder_size_id))].filter(Boolean))];
   const [gasDocs, sizeDocs] = await Promise.all([
-    GasType.find({ _id: { $in: allGasIds } }),
-    CylinderSize.find({ _id: { $in: allSizeIds } })
+    GasType.find({ _id: { $in: allGasIds }, user_id: uid }),
+    CylinderSize.find({ _id: { $in: allSizeIds }, user_id: uid })
   ]);
   const gasName = {}; gasDocs.forEach(g => { gasName[String(g._id)] = g.gas_type_name; });
   const sizeName = {}; sizeDocs.forEach(s => { sizeName[String(s._id)] = s.size_label; });

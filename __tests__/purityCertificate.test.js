@@ -4,7 +4,6 @@
 // genuinely unwritable (not merely un-buttoned), that its customer details are a snapshot rather
 // than a join, and that its numbering is scoped the way bills and receipts are so it can never
 // collide with either.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 

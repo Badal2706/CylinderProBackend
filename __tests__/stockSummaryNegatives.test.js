@@ -12,7 +12,6 @@
 //
 // Wherever those two disagree, the arithmetic produces a negative. Each test below is one such
 // disagreement, written as the behaviour that must hold.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 
@@ -78,8 +77,8 @@ beforeAll(async () => {
     { user_id: user._id, location: OFFICE_A, label: 'Depot Beta' },
     { user_id: user._id, location: OFFICE_B, label: 'Depot Gamma' }
   ]);
-  gas = await GasType.create({ gas_type_name: GAS, is_active: true });
-  size = await CylinderSize.create({ size_label: CAP, is_active: true });
+  gas = await GasType.create({ user_id: user._id, gas_type_name: GAS, is_active: true });
+  size = await CylinderSize.create({ user_id: user._id, size_label: CAP, is_active: true });
 
   vendor = await Customer.create({
     user_id: user._id, company_name: 'Refill Vendor Ltd', customer_type: 'REGULAR',

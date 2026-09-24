@@ -9,7 +9,6 @@
 // transfer document. scripts/expCrossSiteReturn.js proved a transfer double-counts the arrival the
 // RECEIVED line already records, driving the site's opening balance negative. These tests pin both
 // halves down: the warning fires, and the Stock Summary is untouched.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 
@@ -57,8 +56,8 @@ beforeAll(async () => {
     { user_id: user._id, location: CH, label: 'Chandisar Plant', is_filling_location: true },
     { user_id: user._id, location: PA, label: 'Palanpur Office' }
   ]);
-  gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-  size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
+  gas = await GasType.create({ user_id: user._id, gas_type_name: 'Oxygen', is_active: true });
+  size = await CylinderSize.create({ user_id: user._id, size_label: '7 m3', is_active: true });
   customer = await Customer.create({
     user_id: user._id, company_name: 'Cross Site Co', customer_type: 'REGULAR',
     phone_primary: '9000000000', is_active: true, holding_limit: 99

@@ -5,7 +5,6 @@
 // site that already has records would silently rewrite what those documents say happened.
 //
 // The location CODE is permanent either way (R83) — this is only about the display name.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 
@@ -39,8 +38,8 @@ beforeAll(async () => {
     { user_id: user._id, location: PLANT, label: 'Main Plant', is_filling_location: true },
     { user_id: user._id, location: DEPOT, label: 'Side Depot' }
   ]);
-  gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-  size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
+  gas = await GasType.create({ user_id: user._id, gas_type_name: 'Oxygen', is_active: true });
+  size = await CylinderSize.create({ user_id: user._id, size_label: '7 m3', is_active: true });
   customer = await Customer.create({
     user_id: user._id, company_name: 'Any Customer', customer_type: 'REGULAR',
     phone_primary: '9000000000', is_active: true, holding_limit: 99

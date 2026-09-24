@@ -7,7 +7,6 @@
 // What must NOT change: every row, every figure, every total, in every view. This suite builds
 // customers whose figures differ (billed, paid, discounted, holding over and under their limit)
 // and asserts that stitching the pages together gives exactly what one big page gives.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 
@@ -28,8 +27,8 @@ beforeAll(async () => {
 
   const GasType = require('../models/GasType');
   const CylinderSize = require('../models/CylinderSize');
-  const gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-  const size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
+  const gas = await GasType.create({ user_id: user._id, gas_type_name: 'Oxygen', is_active: true });
+  const size = await CylinderSize.create({ user_id: user._id, size_label: '7 m3', is_active: true });
 
   let billNo = 1;
   for (let i = 0; i < NAMES.length; i++) {

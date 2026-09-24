@@ -3,7 +3,6 @@
 //
 // Location and Stock State were already logged (Phase 33) and those lines are unchanged. Gas Type,
 // Size and Maintenance are new. The maintenance endpoint logged nothing at all before.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 

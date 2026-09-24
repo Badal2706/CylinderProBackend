@@ -7,6 +7,12 @@
 //   node scripts/migratePhase10.js
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 
+// SUPERSEDED 24 Sep 2026. This migration assumes ONE global gas/size catalog. Each account now owns
+// its own catalog (user_id on GasType / CylinderSize / GasCapacity), so running this would write
+// rows that belong to no account. It ran once, long ago; it must not run again.
+console.error('Refusing to run: superseded by per-account catalogs (24 Sep 2026). See the note at the top of this file.');
+process.exit(1);
+
 const mongoose = require('mongoose');
 const GasType = require('../models/GasType');
 const GasCapacity = require('../models/GasCapacity');

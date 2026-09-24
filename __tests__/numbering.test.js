@@ -1,6 +1,5 @@
 // Phase GEN-C: the pure numbering helpers — account-code derivation and financial-year maths.
 // No database: everything here is deterministic and side-effect free.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 const N = require('../services/numbering.service');
@@ -29,24 +28,34 @@ describe('GEN-C account code', () => {
     expect(shared).toBeLessThan(4);
   });
 
-  test('the salt actually participates — a different salt gives a different code', () => {
-    const withTestSalt = N.deriveAccountCode(A);
+  // Since 24 Sep 2026 the code is a plain SHA-256 of the id: no server secret. These pin that.
+  test('needs no secret — NUMBERING_SALT has no effect, set or unset', () => {
     const original = process.env.NUMBERING_SALT;
-    process.env.NUMBERING_SALT = 'a-completely-different-salt';
     try {
-      expect(N.deriveAccountCode(A)).not.toBe(withTestSalt);
+      delete process.env.NUMBERING_SALT;
+      const unset = N.deriveAccountCode(A);
+      process.env.NUMBERING_SALT = 'anything-at-all';
+      expect(N.deriveAccountCode(A)).toBe(unset);
     } finally {
-      process.env.NUMBERING_SALT = original;
+      if (original === undefined) delete process.env.NUMBERING_SALT; else process.env.NUMBERING_SALT = original;
     }
   });
 
-  test('refuses to run without a salt rather than silently using a default', () => {
-    const original = process.env.NUMBERING_SALT;
-    delete process.env.NUMBERING_SALT;
-    try {
-      expect(() => N.deriveAccountCode(A)).toThrow(/NUMBERING_SALT/);
-    } finally {
-      process.env.NUMBERING_SALT = original;
+  test('the derivation is pinned — a change to it must be deliberate', () => {
+    // Existing accounts keep the code stored at their signup, so changing this would not break
+    // them — but every account created afterwards would draw from a different scheme.
+    expect(N.deriveAccountCode(A)).toBe('151MBMSK');
+  });
+
+  test('ids minted back-to-back by one process do not get near-identical codes', () => {
+    // The low bytes of an ObjectId are a per-process constant plus a counter, so encoding the raw
+    // id would give neighbouring accounts codes differing in their last characters. Hashing first
+    // is why they come out unrelated.
+    const codes = Array.from({ length: 50 }, () => N.deriveAccountCode(new mongoose.Types.ObjectId()));
+    expect(new Set(codes).size).toBe(50);
+    for (let i = 1; i < codes.length; i++) {
+      const shared = [...codes[i]].filter((ch, k) => ch === codes[i - 1][k]).length;
+      expect(shared).toBeLessThan(4);
     }
   });
 

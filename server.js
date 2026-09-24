@@ -71,15 +71,6 @@ app.use(mongoSanitize);
 // to cluster mode / multiple instances, the in-memory counters become per-process and must be
 // backed by a shared store (Redis) — flag before switching.
 
-// Phase GEN-C: fail at boot, not at the first signup. Every bill and receipt identity is built
-// on the account code this salt derives, so a server running without it would quietly issue
-// documents with a blank identity. Same posture as JWT_SECRET in middleware/auth.js.
-if (!process.env.NUMBERING_SALT) {
-  throw new Error('FATAL: NUMBERING_SALT environment variable is not set. It seeds the permanent ' +
-                  'per-account numbering code. Set it before starting the server, and keep it ' +
-                  'backed up alongside JWT_SECRET.');
-}
-
 // Connect to MongoDB
 connectDB();
 
@@ -126,19 +117,23 @@ const trustedPeopleRoutes = require('./routes/trustedPeople');
 const stepUpRoutes = require('./routes/stepup');
 const purityCertificateRoutes = require('./routes/purityCertificates');
 
-app.use('/api/customers', customerRoutes);
-app.use('/api/bills', billRoutes);
-app.use('/api/payments', paymentRoutes);
-app.use('/api/reports', reportRoutes);
-app.use('/api/dashboard', dashboardRoutes);
+// Business-data routers never send the account's internal identity (account_code and the *_uid
+// fields built on it) to the browser. /api/profile is deliberately left out — see the middleware.
+const stripInternalIds = require('./middleware/stripInternalIds');
+
+app.use('/api/customers', stripInternalIds, customerRoutes);
+app.use('/api/bills', stripInternalIds, billRoutes);
+app.use('/api/payments', stripInternalIds, paymentRoutes);
+app.use('/api/reports', stripInternalIds, reportRoutes);
+app.use('/api/dashboard', stripInternalIds, dashboardRoutes);
 app.use('/api/masters', masterRoutes);
-app.use('/api/cylinders', cylinderRoutes);
+app.use('/api/cylinders', stripInternalIds, cylinderRoutes);
 app.use('/api/profile', profileRoutes);
-app.use('/api/rental-charges', rentalChargeRoutes);
-app.use('/api/filling-log', fillingLogRoutes);
+app.use('/api/rental-charges', stripInternalIds, rentalChargeRoutes);
+app.use('/api/filling-log', stripInternalIds, fillingLogRoutes);
 app.use('/api/trusted-people', trustedPeopleRoutes);
 app.use('/api/step-up', stepUpRoutes);
-app.use('/api/purity-certificates', purityCertificateRoutes);
+app.use('/api/purity-certificates', stripInternalIds, purityCertificateRoutes);
 
 // Error handling middleware — never leak raw stack/objects to the client.
 app.use((err, req, res, next) => {

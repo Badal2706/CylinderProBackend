@@ -2,7 +2,6 @@
 // database rather than in isolation. These are the assertions that matter for a live billing
 // system — two clients must never fight over a number, and a series that restarts each 1 April
 // must actually restart.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 const User = require('../models/User');
@@ -26,7 +25,9 @@ const CH = 'AT_PLANT_CHANDISAR';
 const FY26 = new Date('2026-06-15T10:00:00+05:30');   // FY 2026-27
 const FY27 = new Date('2027-06-15T10:00:00+05:30');   // FY 2027-28
 
-let gas, size;
+// Each account's own gas type and size — catalogs are per-account (24 Sep 2026), so two accounts
+// can no longer share one "Oxygen".
+const catalogOf = {};
 
 // A complete, independent account: user + code + filling location + a customer.
 async function makeAccount(label, { fyReset = false } = {}) {
@@ -37,6 +38,10 @@ async function makeAccount(label, { fyReset = false } = {}) {
   await BusinessProfile.create({ user_id: user._id, fy_reset_numbering: fyReset });
   const cust = await Customer.create({
     user_id: user._id, company_name: `${label} Co`, phone_primary: '9999999999', holding_limit: 500 });
+  catalogOf[String(user._id)] = {
+    gas: await GasType.create({ user_id: user._id, gas_type_name: 'Oxygen', is_active: true }),
+    size: await CylinderSize.create({ user_id: user._id, size_label: '7 m3', is_active: true })
+  };
   acct._clearCache();
   return { uid: user._id, code: N.deriveAccountCode(user._id), cust };
 }
@@ -47,7 +52,7 @@ const makeBill = (uid, cust, date, billNumber) => billSvc.createBill(uid, {
   // Personal (quantity-only) cylinders: the account's numbering is what is under test here,
   // not its inventory, and this keeps the fixture free of real Cylinder documents.
   given_items: [{
-    gas_type_id: String(gas._id), cylinder_size_id: String(size._id),
+    gas_type_id: String(catalogOf[String(uid)].gas._id), cylinder_size_id: String(catalogOf[String(uid)].size._id),
     quantity: 0, rate: 100, personalCylindersIn: 1
   }]
 });
@@ -55,8 +60,6 @@ const makeBill = (uid, cust, date, billNumber) => billSvc.createBill(uid, {
 beforeAll(async () => {
   await mongoose.connect(TEST_DB);
   await Promise.all([Bill.syncIndexes(), Payment.syncIndexes(), Counter.syncIndexes(), LocationProfile.syncIndexes()]);
-  gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-  size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
 });
 afterAll(async () => { await mongoose.connection.dropDatabase(); await mongoose.connection.close(); });
 

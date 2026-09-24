@@ -54,10 +54,11 @@ const check = (l, ok, d) => { results.push(!!ok); console.log(`  ${ok ? 'OK  ' :
   }).sort('-bill_date -createdAt').select('customer_id bill_number').lean();
   const cust = holder && holder.customer_id ? await Customer.findById(holder.customer_id).select('company_name').lean() : null;
 
-  const gas = await GasType.findOne({ gas_type_name: cyl.gas_type }).lean()
-           || await GasType.findOne().lean();
-  const size = await CylinderSize.findOne({ size_label: cyl.capacity }).lean()
-           || await CylinderSize.findOne().lean();
+  // This account's own catalog — every account has its own "Oxygen" since 24 Sep 2026.
+  const gas = await GasType.findOne({ user_id: user._id, gas_type_name: cyl.gas_type }).lean()
+           || await GasType.findOne({ user_id: user._id }).lean();
+  const size = await CylinderSize.findOne({ user_id: user._id, size_label: cyl.capacity }).lean()
+           || await CylinderSize.findOne({ user_id: user._id }).lean();
 
   console.log(`\ntest cylinder : ${cyl.rotational_number}  (${cyl.gas_type} / ${cyl.capacity})`);
   console.log(`issued from   : ${labels[from] || from}`);

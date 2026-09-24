@@ -1,20 +1,27 @@
 const express = require('express');
 const router = express.Router();
-const { requireStepUpAny } = require('../middleware/stepUp');
+const authMiddleware = require('../middleware/auth');
+const { stepUpGate } = require('../middleware/stepUp');
 const ctrl = require('../controllers/masters.controller');
 
-// NOTE: reads stay unauthenticated — these are global catalogs, not per-tenant data.
-// Mutations require a verified step-up approval token (Phase 18): the token itself proves a
-// trusted person approved the change, so no session auth is needed here.
+// Each account owns its own catalogs (24 Sep 2026), so every route is signed-in and works on the
+// caller's catalog only. Until then these were global, reads were public, and a mutation needed
+// only SOME account's step-up token — so one tenant could change another's catalog.
+router.use(authMiddleware);
+
+// Mutations still need a verified step-up approval (Phase 18), now bound to the signed-in account.
+// The label keeps the refusal message word-for-word what it was.
+const approved = stepUpGate('Changing the gas/size catalogs');
+
 router.get('/gas-types', ctrl.listGasTypes);
-router.post('/gas-types', requireStepUpAny, ctrl.createGasType);
-router.delete('/gas-types/:id', requireStepUpAny, ctrl.deleteGasType);
+router.post('/gas-types', approved, ctrl.createGasType);
+router.delete('/gas-types/:id', approved, ctrl.deleteGasType);
 router.get('/cylinder-sizes', ctrl.listCylinderSizes);
-router.post('/cylinder-sizes', requireStepUpAny, ctrl.createCylinderSize);
-router.delete('/cylinder-sizes/:id', requireStepUpAny, ctrl.deleteCylinderSize);
+router.post('/cylinder-sizes', approved, ctrl.createCylinderSize);
+router.delete('/cylinder-sizes/:id', approved, ctrl.deleteCylinderSize);
 // Per-gas scoped size catalog (Phase 10) — the runtime gas → sizes source of truth.
 router.get('/gas-capacities', ctrl.getGasCapacities);
-router.post('/gas-capacities/:gas/sizes', requireStepUpAny, ctrl.addSizeToGas);
-router.delete('/gas-capacities/:gas/sizes', requireStepUpAny, ctrl.removeSizeFromGas);
+router.post('/gas-capacities/:gas/sizes', approved, ctrl.addSizeToGas);
+router.delete('/gas-capacities/:gas/sizes', approved, ctrl.removeSizeFromGas);
 
 module.exports = router;

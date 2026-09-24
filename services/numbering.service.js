@@ -5,8 +5,8 @@ const crypto = require('crypto');
 // Two independent jobs live here, both pure (no database access) so they can be reasoned about
 // and tested in isolation:
 //
-//   1. ACCOUNT CODE — an 8-character [A-Z0-9] code derived from the account's _id plus a server
-//      salt. It scopes the uniqueness of bill and receipt numbers to one account, so two
+//   1. ACCOUNT CODE — an 8-character [A-Z0-9] code derived from the account's _id alone. It
+//      scopes the uniqueness of bill and receipt numbers to one account, so two
 //      CylinderPro clients can each issue "1A001" without colliding. It is DERIVED from the
 //      immutable account _id, never from the email — the app has a working email-change flow
 //      (routes/profile.js), and a code derived from a mutable field would orphan every record
@@ -25,32 +25,27 @@ const crypto = require('crypto');
 const ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 const CODE_LEN = 8;
 
-// The salt is what makes the code unguessable from an account id alone. Losing it does NOT make
-// existing data unreadable — every account's code is STORED once at signup, never re-derived on
-// read — but it would mean newly created accounts get codes from a different keyspace, so it
-// belongs in the same "back this up" category as JWT_SECRET.
-function getSalt() {
-  const salt = process.env.NUMBERING_SALT;
-  if (!salt) {
-    throw new Error(
-      'FATAL: NUMBERING_SALT is not set. It seeds the per-account numbering code. ' +
-      'Set it before starting the server, and keep it with your other secrets.'
-    );
-  }
-  return salt;
-}
-
-// Deterministic 8-character [A-Z0-9] code for one account.
+// Deterministic 8-character [A-Z0-9] code for one account, from its _id and nothing else.
 //
-// Reads the hash as a big integer and takes it modulo 36 eight times. Doing this over a
-// 256-bit HMAC rather than, say, one byte per character avoids the modulo bias that mapping
-// each byte through % 36 would introduce (256 is not a multiple of 36, so low symbols would
-// come up measurably more often).
+// Until 24 Sep 2026 this was an HMAC keyed by a NUMBERING_SALT server secret. The secret bought
+// nothing the code needed — it is not a credential, it is never shown, and it is stored rather than
+// recomputed — but it was one more thing that had to survive a server rebuild. It is now a plain
+// SHA-256 of the id. A hash rather than the raw ObjectId bytes, because the low bytes of an
+// ObjectId are a per-process constant plus a counter: two accounts created by one server process
+// would get codes differing only in their last few characters.
+//
+// Codes already stored (every account created before the change) came from the salted version and
+// stay exactly as they are — this function is only ever called at signup, never on read, so
+// re-deriving an old account's code would not match, and nothing ever does (R105).
+//
+// Reads the hash as a big integer and takes it modulo 36 eight times. Doing this over a 256-bit
+// hash rather than one byte per character avoids the modulo bias that mapping each byte through
+// % 36 would introduce (256 is not a multiple of 36, so low symbols would come up more often).
 function deriveAccountCode(userId) {
   const id = String(userId || '').trim();
   if (!id) throw new Error('deriveAccountCode: an account id is required');
 
-  const digest = crypto.createHmac('sha256', getSalt()).update(id).digest();
+  const digest = crypto.createHash('sha256').update(id).digest();
   let n = BigInt('0x' + digest.toString('hex'));
   const base = BigInt(ALPHABET.length);
 

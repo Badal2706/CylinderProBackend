@@ -2,9 +2,8 @@
 //
 // The properties worth pinning down are the ones that make a leaked licence worthless:
 // it is bound to ONE email, it is spent while its account lives, and it comes back when that
-// account is deleted. Plus the migration guarantee: the old token still works, so a deploy cannot
-// lock production out of signup before a licence has been issued there.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
+// account is deleted. And there is no other key: the legacy DEVELOPER_TOKEN was removed on
+// 24 Sep 2026. The variable is deliberately left SET here, to prove the code no longer reads it.
 process.env.DEVELOPER_TOKEN = 'legacy-token-for-tests';
 process.env.SIGNUP_GATEKEEPER_EMAIL = 'gatekeeper@test.invalid';
 // signupRequest signs a short-lived pending token; without this it throws before it gets there.
@@ -12,8 +11,14 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret-do-not-use-i
 
 const mongoose = require('mongoose');
 
+const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Licence = require('../models/Licence');
+const GasType = require('../models/GasType');
+const GasCapacity = require('../models/GasCapacity');
+const CylinderSize = require('../models/CylinderSize');
+const N = require('../services/numbering.service');
+const { GAS_CAPACITIES } = require('../config/gasCapacities');
 const licenceSvc = require('../services/licence.service');
 const authSvc = require('../services/auth.service');
 const profileSvc = require('../services/profile.service');
@@ -31,8 +36,10 @@ afterAll(async () => {
   await mongoose.connection.close();
 });
 afterEach(async () => {
+  jest.restoreAllMocks();
   await Licence.deleteMany({});
   await User.deleteMany({});
+  await Promise.all([GasType.deleteMany({}), GasCapacity.deleteMany({}), CylinderSize.deleteMany({})]);
 });
 
 describe('issuing', () => {
@@ -76,7 +83,6 @@ describe('validation', () => {
   test('a correct licence for its own address passes', async () => {
     const { key } = await licenceSvc.issueLicence({ email: CLIENT });
     const res = await licenceSvc.validateForSignup(key, CLIENT);
-    expect(res.legacy).toBe(false);
     expect(res.licence).toBeTruthy();
   });
 
@@ -117,10 +123,9 @@ describe('validation', () => {
     await expect(licenceSvc.validateForSignup(undefined, CLIENT)).rejects.toThrow(/licence number is required/i);
   });
 
-  test('the legacy DEVELOPER_TOKEN still passes, and claims nothing', async () => {
-    const res = await licenceSvc.validateForSignup('legacy-token-for-tests', 'anyone@example.com');
-    expect(res.legacy).toBe(true);
-    expect(res.licence).toBeNull();
+  test('the retired DEVELOPER_TOKEN opens nothing, even with the variable still set', async () => {
+    await expect(licenceSvc.validateForSignup('legacy-token-for-tests', 'anyone@example.com'))
+      .rejects.toThrow('Invalid licence number');
   });
 });
 
@@ -248,13 +253,13 @@ describe('signup end to end', () => {
     spy.mockRestore();
   });
 
-  test('an older frontend sending developer_token still works', async () => {
+  test('the retired developer_token field opens nothing, and sends no OTP', async () => {
     const otp = require('../services/otp.service');
     const spy = jest.spyOn(otp, 'sendOtp').mockResolvedValue(true);
-    const res = await authSvc.signupRequest({
+    await expect(authSvc.signupRequest({
       name: 'C', email: CLIENT, password: 'Test1234!', developer_token: 'legacy-token-for-tests'
-    });
-    expect(res.requires_otp).toBe(true);
+    })).rejects.toThrow(/licence number is required/i);
+    expect(spy).not.toHaveBeenCalled();
     spy.mockRestore();
   });
 
@@ -266,5 +271,148 @@ describe('signup end to end', () => {
     await expect(authSvc.signupRequest({
       name: 'C', email: CLIENT, password: 'Test1234!', licence_number: key
     })).rejects.toThrow(/already in use/i);
+  });
+});
+
+// Drives signup through BOTH real service calls. Only the OTP delivery and check are stubbed —
+// what is under test is what confirm writes once the gatekeeper has approved.
+async function signUp(email, key) {
+  const otp = require('../services/otp.service');
+  jest.spyOn(otp, 'sendOtp').mockResolvedValue(true);
+  jest.spyOn(otp, 'verifyOtp').mockResolvedValue(true);
+  const { pending_token } = await authSvc.signupRequest({ name: 'New Client', email, password: 'Test1234!', licence_number: key });
+  return authSvc.signupConfirm({ pending_token, code: '000000' });
+}
+
+describe('signup confirm creates the account, its licence binding and its catalog as ONE unit', () => {
+  const gasCount = Object.keys(GAS_CAPACITIES).length;
+  const sizeCount = new Set(Object.values(GAS_CAPACITIES).flat()).size;
+
+  test('success: all three exist, and the account code is derived from the new id', async () => {
+    const { key, licence_id } = await licenceSvc.issueLicence({ email: CLIENT });
+    const res = await signUp(CLIENT, key);
+    expect(res.token).toBeTruthy();
+
+    const user = await User.findOne({ email: CLIENT }).lean();
+    expect(user.account_code).toBe(N.deriveAccountCode(user._id));
+    expect(user.account_code).toMatch(/^[A-Z0-9]{8}$/);
+    expect(String((await Licence.findById(licence_id).lean()).used_by)).toBe(String(user._id));
+
+    // its own copy of the config defaults — not another account's catalog
+    expect(await GasType.countDocuments({ user_id: user._id })).toBe(gasCount);
+    expect(await GasCapacity.countDocuments({ user_id: user._id })).toBe(gasCount);
+    expect(await CylinderSize.countDocuments({ user_id: user._id })).toBe(sizeCount);
+  });
+
+  test('a claim that fails after the account is written leaves no account behind', async () => {
+    const { key, licence_id } = await licenceSvc.issueLicence({ email: CLIENT });
+    jest.spyOn(licenceSvc, 'claim').mockRejectedValue(new Error('simulated failure between the writes'));
+
+    await expect(signUp(CLIENT, key)).rejects.toThrow('simulated failure');
+    expect(await User.countDocuments({ email: CLIENT })).toBe(0);
+    expect((await Licence.findById(licence_id).lean()).used_by).toBeNull();
+    expect(await GasType.countDocuments({})).toBe(0);
+  });
+
+  test('a catalog write that fails after the claim frees the licence again and removes the account', async () => {
+    const { key, licence_id } = await licenceSvc.issueLicence({ email: CLIENT });
+    const masters = require('../services/masters.service');
+    jest.spyOn(masters, 'seedDefaultCatalog').mockRejectedValue(new Error('simulated catalog failure'));
+
+    await expect(signUp(CLIENT, key)).rejects.toThrow('simulated catalog failure');
+    expect(await User.countDocuments({ email: CLIENT })).toBe(0);
+    expect((await Licence.findById(licence_id).lean()).used_by).toBeNull();
+    // …and the number works again for the same client
+    await expect(licenceSvc.validateForSignup(key, CLIENT)).resolves.toBeTruthy();
+  });
+
+  test('two accounts get separate catalogs and see only their own', async () => {
+    const one = await licenceSvc.issueLicence({ email: 'one@example.com' });
+    const two = await licenceSvc.issueLicence({ email: 'two@example.com' });
+    await signUp('one@example.com', one.key);
+    jest.restoreAllMocks();
+    await signUp('two@example.com', two.key);
+
+    const a = await User.findOne({ email: 'one@example.com' }).lean();
+    const b = await User.findOne({ email: 'two@example.com' }).lean();
+    const masters = require('../services/masters.service');
+    const aGas = await masters.listGasTypes(a._id);
+    const bGas = await masters.listGasTypes(b._id);
+    expect(aGas).toHaveLength(gasCount);
+    expect(bGas).toHaveLength(gasCount);
+    const aIds = new Set(aGas.map(g => String(g._id)));
+    expect(bGas.some(g => aIds.has(String(g._id)))).toBe(false);   // no shared rows
+    expect(a.account_code).not.toBe(b.account_code);
+  });
+});
+
+describe('binding an account that predates licences', () => {
+  test('issues a licence and binds it, touching nothing on the account itself', async () => {
+    const user = await User.create({ name: 'Old', email: CLIENT, password: 'Test1234!' });
+    const before = await User.findById(user._id).lean();
+
+    const out = await licenceSvc.bindToExistingAccount({ email: CLIENT, userId: user._id, note: 'Guru Industries' });
+    expect(out.key).toMatch(/^CP-/);
+
+    const l = await Licence.findById(out.licence_id).lean();
+    expect(String(l.used_by)).toBe(String(user._id));
+    expect(l.email).toBe(CLIENT);
+    expect(l.note).toBe('Guru Industries');
+    expect(l.history).toHaveLength(1);
+    // spent while the account lives — exactly as if the account had signed up with it
+    await expect(licenceSvc.validateForSignup(out.key, CLIENT)).rejects.toThrow(/already in use/i);
+
+    expect(await User.findById(user._id).lean()).toEqual(before);
+  });
+
+  test('refuses when the email and the id name different accounts, and leaves no licence', async () => {
+    const user = await User.create({ name: 'Old', email: CLIENT, password: 'Test1234!' });
+    await expect(licenceSvc.bindToExistingAccount({ email: 'other@example.com', userId: user._id }))
+      .rejects.toThrow(/refusing to bind/i);
+    expect(await Licence.countDocuments({})).toBe(0);
+  });
+
+  test('refuses an account that already holds a licence', async () => {
+    const user = await User.create({ name: 'Old', email: CLIENT, password: 'Test1234!' });
+    await licenceSvc.bindToExistingAccount({ email: CLIENT, userId: user._id });
+    await expect(licenceSvc.bindToExistingAccount({ email: CLIENT, userId: user._id }))
+      .rejects.toThrow(/already holds licence/i);
+    expect(await Licence.countDocuments({})).toBe(1);
+  });
+
+  test('refuses an unknown account id', async () => {
+    await expect(licenceSvc.bindToExistingAccount({ email: CLIENT, userId: new mongoose.Types.ObjectId() }))
+      .rejects.toThrow(/No account has that id/i);
+    expect(await Licence.countDocuments({})).toBe(0);
+  });
+});
+
+describe('the licence follows a confirmed email change', () => {
+  test('its address moves to the new login email; history keeps the old one', async () => {
+    const user = await User.create({ name: 'Mover', email: CLIENT, password: 'Test1234!' });
+    const { key, licence_id } = await licenceSvc.bindToExistingAccount({ email: CLIENT, userId: user._id });
+
+    jest.spyOn(require('../services/otp.service'), 'verifyOtp').mockResolvedValue(true);
+    jest.spyOn(require('../services/trustedPeople.service'), 'syncBootstrap').mockResolvedValue(true);
+    jest.spyOn(require('../services/totp.service'), 'beginRotationForAccountEmail').mockResolvedValue(null);
+    const pending_token = jwt.sign(
+      { id: String(user._id), purpose: 'email_change', email: 'moved@example.com' },
+      process.env.JWT_SECRET, { expiresIn: 900 });
+
+    await profileSvc.confirmEmailChange(user._id, { pending_token, code: '000000' });
+
+    const l = await Licence.findById(licence_id).lean();
+    expect(l.email).toBe('moved@example.com');
+    expect(l.history[0].email).toBe(CLIENT);          // the binding as it was made
+    // …so once the account is deleted, the number re-creates it at the address actually in use —
+    // and no longer at the old one
+    await licenceSvc.releaseForUser(user._id);
+    await expect(licenceSvc.validateForSignup(key, 'moved@example.com')).resolves.toBeTruthy();
+    await expect(licenceSvc.validateForSignup(key, CLIENT)).rejects.toThrow(/different email address/i);
+  });
+
+  test('an account with no licence is simply left alone', async () => {
+    const user = await User.create({ name: 'Unlicensed', email: CLIENT, password: 'Test1234!' });
+    expect(await licenceSvc.syncEmailForUser(user._id, 'x@example.com')).toBeNull();
   });
 });

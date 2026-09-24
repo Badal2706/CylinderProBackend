@@ -31,8 +31,8 @@ describe('cylinder history follows the bill', () => {
     const user = await User.create({ name: 'HL', email: 'hl@test.com', password: 'Test1234!' });
     uid = user._id;
     await LocationProfile.create([{ user_id: uid, location: CH, manager_name: 'Raju' }]);
-    gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-    size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
+    gas = await GasType.create({ user_id: uid, gas_type_name: 'Oxygen', is_active: true });
+    size = await CylinderSize.create({ user_id: uid, size_label: '7 m3', is_active: true });
     cust = await Customer.create({ user_id: uid, company_name: 'Acme', phone_primary: '1', holding_limit: 100 });
     vendor = await Customer.create({ user_id: uid, company_name: 'FillCo', phone_primary: '2', holding_limit: 100, is_filling_vendor: true });
   });
@@ -119,8 +119,8 @@ describe('re-dating a bill is validated', () => {
     const user = await User.create({ name: 'DC', email: 'dc@test.com', password: 'Test1234!' });
     uid = user._id;
     await LocationProfile.create([{ user_id: uid, location: CH, manager_name: 'Raju' }]);
-    gas = await GasType.findOne({ gas_type_name: 'Oxygen' }) || await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-    size = await CylinderSize.findOne({ size_label: '7 m3' }) || await CylinderSize.create({ size_label: '7 m3', is_active: true });
+    gas = await GasType.findOne({ user_id: uid, gas_type_name: 'Oxygen' }) || await GasType.create({ user_id: uid, gas_type_name: 'Oxygen', is_active: true });
+    size = await CylinderSize.findOne({ user_id: uid, size_label: '7 m3' }) || await CylinderSize.create({ user_id: uid, size_label: '7 m3', is_active: true });
     cust = await Customer.create({ user_id: uid, company_name: 'DateCo', phone_primary: '3', holding_limit: 100 });
     await cylSvc.createCylinder(uid, { rotational_number: 'D1', gas_type: 'Oxygen', capacity: '7 m3', location: CH, stock_state: 'IN_STOCK' });
   });

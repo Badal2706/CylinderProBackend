@@ -33,8 +33,8 @@ describe('Cylinder history (Phase 33)', () => {
       { user_id: uid, location: 'AT_PLANT_CHANDISAR', manager_name: 'Ramesh', is_filling_location: true },
       { user_id: uid, location: 'AT_PALANPUR_OFFICE', manager_name: 'Suresh' }
     ]);
-    gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-    size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
+    gas = await GasType.create({ user_id: uid, gas_type_name: 'Oxygen', is_active: true });
+    size = await CylinderSize.create({ user_id: uid, size_label: '7 m3', is_active: true });
     cust = await Customer.create({ user_id: uid, company_name: 'Acme Gases', phone_primary: '9999999999', holding_limit: 100 });
     C1 = (await cylSvc.createCylinder(uid, { rotational_number: 'H-1', gas_type: 'Oxygen', capacity: '7 m3', location: 'AT_PLANT_CHANDISAR', stock_state: 'IN_STOCK' })).cylinder_id;
     C2 = (await cylSvc.createCylinder(uid, { rotational_number: 'H-2', gas_type: 'Oxygen', capacity: '7 m3', location: 'AT_PLANT_CHANDISAR', stock_state: 'IN_STOCK' })).cylinder_id;

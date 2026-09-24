@@ -6,11 +6,13 @@ const SALT_ROUNDS = 10; // minimum per security policy
 const userSchema = new mongoose.Schema({
   name:  { type: String, required: true, trim: true },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-  // Phase GEN-C: 8-character [A-Z0-9] code derived ONCE at signup from this account's _id plus
-  // NUMBERING_SALT (services/numbering.service.js). Stored, never re-derived on read — so
-  // rotating the salt cannot make existing data unreadable, and it is immutable because bill and
-  // receipt identities are built on it. Never shown in the UI or on a printed document.
-  account_code: { type: String, default: '', immutable: true, index: true },
+  // Phase GEN-C: 8-character [A-Z0-9] code derived ONCE at signup from this account's _id
+  // (services/numbering.service.js). Stored, never re-derived on read, and immutable because bill
+  // and receipt identities are built on it. Never shown in the UI, on a printed document, or in a
+  // bill/payment/certificate API response (middleware/stripInternalIds.js).
+  // Accounts created before 24 Sep 2026 carry a code from the older salted derivation; that is
+  // correct and permanent — nothing ever recomputes a stored code. Indexed below, uniquely.
+  account_code: { type: String, default: '', immutable: true },
   password: { type: String, required: true },
   phone: { type: String, default: '' },
   // Site the user is currently "operating as" — drives UI defaults only (never rewrites data).
@@ -46,6 +48,15 @@ const userSchema = new mongoose.Schema({
     default: []
   }
 }, { timestamps: true });
+
+// Two accounts must never share a code: bills, receipts and certificates are unique per
+// (account_code, financial_year, number), so a shared code would let one client's numbers collide
+// with another's. A collision is astronomically unlikely, but this makes one fail loudly at signup
+// (inside its transaction) instead of silently. Partial, so the '' default never counts as a value.
+userSchema.index(
+  { account_code: 1 },
+  { name: 'account_code_unique', unique: true, partialFilterExpression: { account_code: { $gt: '' } } }
+);
 
 userSchema.pre('save', async function() {
   if (!this.isModified('password')) return;

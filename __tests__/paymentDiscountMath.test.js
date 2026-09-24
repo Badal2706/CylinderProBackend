@@ -12,7 +12,6 @@
 // Both wrong answers are asserted against explicitly, because the obvious "fix" (adding the
 // discount into the same sum that `- totalDiscount` already covers) over-credits by the discount
 // and is just as wrong as the original. A test that only checked `!== old` would pass on it.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 
@@ -51,8 +50,8 @@ beforeAll(async () => {
 
   const GasType = require('../models/GasType');
   const CylinderSize = require('../models/CylinderSize');
-  const gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-  const size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
+  const gas = await GasType.create({ user_id: user._id, gas_type_name: 'Oxygen', is_active: true });
+  const size = await CylinderSize.create({ user_id: user._id, size_label: '7 m3', is_active: true });
 
   await Bill.create({
     user_id: user._id, customer_id: customer._id, bill_number: '1A001',

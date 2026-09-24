@@ -37,8 +37,8 @@ describe('cross-customer return settlement — collateral serials', () => {
     const user = await User.create({ name: 'SET', email: 'settle@test.com', password: 'Test1234!' });
     uid = user._id;
     await LocationProfile.create([{ user_id: uid, location: CH, manager_name: 'Raju' }]);
-    gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-    size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
+    gas = await GasType.create({ user_id: uid, gas_type_name: 'Oxygen', is_active: true });
+    size = await CylinderSize.create({ user_id: uid, size_label: '7 m3', is_active: true });
     custA = await Customer.create({ user_id: uid, company_name: 'Cust A', phone_primary: '1', holding_limit: 500 });
     custB = await Customer.create({ user_id: uid, company_name: 'Cust B', phone_primary: '2', holding_limit: 500 });
   });

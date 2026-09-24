@@ -31,8 +31,8 @@ beforeAll(async () => {
     { user_id: uid, location: CH, label: 'Chandisar Plant', manager_name: 'Raju', is_filling_location: true },
     { user_id: uid, location: PA, label: 'Palanpur Office', manager_name: 'Manish' }
   ]);
-  await GasType.findOne({ gas_type_name: 'Oxygen' }) || await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-  await CylinderSize.findOne({ size_label: '7 m3' }) || await CylinderSize.create({ size_label: '7 m3', is_active: true });
+  await GasType.findOne({ user_id: uid, gas_type_name: 'Oxygen' }) || await GasType.create({ user_id: uid, gas_type_name: 'Oxygen', is_active: true });
+  await CylinderSize.findOne({ user_id: uid, size_label: '7 m3' }) || await CylinderSize.create({ user_id: uid, size_label: '7 m3', is_active: true });
 });
 
 afterAll(async () => {

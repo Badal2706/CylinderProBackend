@@ -55,17 +55,19 @@ const createArchive = (opts) => {
 // guessing at an older or newer shape.
 const BACKUP_FORMAT = 1;
 
-// scope 'user'   — rows belong to one account, matched on user_id
-// scope 'global' — shared catalogs with no user_id at all (see routes/masters.js: "global
-//                  catalogs, not per-tenant data"). Restored by merge, never blind insert.
+// scope 'user' — rows belong to one account, matched on user_id. Every collection is per-account:
+//                the gas/size catalogs were a global 'global' scope until 24 Sep 2026, when each
+//                account got its own copy (masters.service). An archive written before then
+//                carries catalog rows with no user_id; restore sets user_id on every row it writes,
+//                so those archives still restore.
 //
 // ORDER IS LOAD-BEARING: it is the order a restore inserts in.
 const COLLECTIONS = [
   { key: 'locationprofiles', model: 'LocationProfile', scope: 'user' },
   { key: 'businessprofiles', model: 'BusinessProfile', scope: 'user' },
-  { key: 'gastypes', model: 'GasType', scope: 'global' },
-  { key: 'gascapacities', model: 'GasCapacity', scope: 'global' },
-  { key: 'cylindersizes', model: 'CylinderSize', scope: 'global' },
+  { key: 'gastypes', model: 'GasType', scope: 'user' },
+  { key: 'gascapacities', model: 'GasCapacity', scope: 'user' },
+  { key: 'cylindersizes', model: 'CylinderSize', scope: 'user' },
   { key: 'customers', model: 'Customer', scope: 'user' },
   { key: 'cylinders', model: 'Cylinder', scope: 'user' },
   { key: 'bills', model: 'Bill', scope: 'user' },

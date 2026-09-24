@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const User = require('../models/User');
 const Customer = require('../models/Customer');
 const Bill = require('../models/Bill');
@@ -47,38 +48,22 @@ async function openSession(user, { remember = false, device = '', ip = '' } = {}
 }
 
 // A LICENCE NUMBER is required for signup — issued to one email address, usable once while the
-// account it created still exists (see services/licence.service.js and models/Licence.js).
-//
-// DEVELOPER_TOKEN is the legacy scheme it replaces: one static string, no expiry, not tied to any
-// address, recorded nowhere, able to create unlimited accounts. It is still accepted as a fallback
-// so a deploy cannot lock the droplet out of signup before a licence has been issued there — the
-// licence service logs every use of it.
+// account it created still exists (see services/licence.service.js and models/Licence.js). It is the
+// only way in: the legacy DEVELOPER_TOKEN fallback was removed on 24 Sep 2026.
 //
 // All signup OTPs go to the gatekeeper email for approval.
-const DEVELOPER_TOKEN = process.env.DEVELOPER_TOKEN;
 const SIGNUP_GATEKEEPER_EMAIL = process.env.SIGNUP_GATEKEEPER_EMAIL;
 
-// SIGNUP_GATEKEEPER_EMAIL is still mandatory in production — without it no signup OTP can be
-// delivered and the flow is dead. DEVELOPER_TOKEN is NOT mandatory any more: licences replaced it,
-// and an install that has issued licences and dropped the env var is in the better state, not a
-// broken one. Its absence is worth a line in the log, not a refusal to boot.
+// SIGNUP_GATEKEEPER_EMAIL is mandatory in production — without it no signup OTP can be delivered
+// and the flow is dead.
 if (process.env.NODE_ENV === 'production' && !SIGNUP_GATEKEEPER_EMAIL) {
   throw new Error('SIGNUP_GATEKEEPER_EMAIL must be set in production');
 }
-if (process.env.NODE_ENV === 'production' && DEVELOPER_TOKEN) {
-  console.warn('[licence] DEVELOPER_TOKEN is still set — the legacy signup fallback is active. ' +
-    'Issue licence numbers (scripts/issueLicence.js) and remove it.');
-}
 
-async function signupRequest({ name, email, password, licence_number, developer_token }) {
+async function signupRequest({ name, email, password, licence_number }) {
   if (!name || !email || !password) {
     throw new HttpError(400, 'Name, email and password are required');
   }
-  // `developer_token` is still read so a browser holding an older cached bundle keeps working;
-  // both names carry the same field.
-  const submittedKey = licence_number !== undefined && licence_number !== null && String(licence_number).trim()
-    ? licence_number
-    : developer_token;
 
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw new HttpError(400, 'Please enter a valid email address');
@@ -86,7 +71,7 @@ async function signupRequest({ name, email, password, licence_number, developer_
   // Validated BEFORE the OTP is sent: a wrong licence must fail immediately rather than after a
   // round trip through the gatekeeper's inbox. The licence is bound to the ADDRESS, so this needs
   // the email to have been checked first.
-  await require('./licence.service').validateForSignup(submittedKey, email);
+  await require('./licence.service').validateForSignup(licence_number, email);
   if (password.length < 8) {
     throw new HttpError(400, 'Password must be at least 8 characters');
   }
@@ -100,7 +85,7 @@ async function signupRequest({ name, email, password, licence_number, developer_
   // travels with it because the binding can only happen once the account exists, which is two
   // requests away — and it is re-validated at that point, never trusted from here alone.
   const pendingToken = jwt.sign(
-    { name, email: email.toLowerCase(), password, licence_number: submittedKey, purpose: 'signup' },
+    { name, email: email.toLowerCase(), password, licence_number, purpose: 'signup' },
     JWT_SECRET,
     { expiresIn: 600 }
   );
@@ -134,26 +119,39 @@ async function signupConfirm({ pending_token, code, remember, device, ip }) {
   // Re-validated here, not trusted from the pending token: ten minutes have passed, and the
   // licence may have been revoked or claimed by another signup in between.
   const licenceSvc = require('./licence.service');
-  const { legacy, licence } = await licenceSvc.validateForSignup(payload.licence_number, payload.email);
+  const { licence } = await licenceSvc.validateForSignup(payload.licence_number, payload.email);
 
-  const user = new User({ name: payload.name, email: payload.email, password: payload.password });
-  // Phase GEN-C: derive the permanent account code NOW, from the _id Mongoose has already
-  // assigned. It is immutable once saved, and every bill and receipt identity is built on it —
-  // an account created without one would issue documents with a blank identity.
-  user.account_code = require('./numbering.service').deriveAccountCode(user._id);
-  await user.save();
+  // Phase GEN-C: the permanent account code is derived from the account _id. Both are chosen here,
+  // once, so every attempt of the transaction below writes the same account — withTransaction may
+  // retry its callback, and a retry must not mint a second id.
+  const userId = new mongoose.Types.ObjectId();
+  const accountCode = require('./numbering.service').deriveAccountCode(userId);
 
-  // Bound AFTER the account exists and BEFORE anything else, so a licence can never be left
-  // unclaimed behind a live account. If another signup won the race, the half-created account is
-  // removed rather than left orphaned holding no licence.
-  if (!legacy) {
-    try {
-      await licenceSvc.claim(licence._id, user._id, user.email);
-    } catch (e) {
-      await User.deleteOne({ _id: user._id });
-      throw e;
+  // The account, the licence binding and the account's own gas/size catalog are ONE unit: either
+  // all three exist or none does. On production this is a transaction, so even a crash between the
+  // writes cannot leave a live account with no licence bound, or one with empty dropdowns. Where
+  // transactions are unavailable (a standalone local mongod) the writes run in order and a failure
+  // removes whatever was written — the behaviour signup had before (utils/transactions.js).
+  const createAccount = async (session) => {
+    // create([...]) rather than new User().save(): a fresh document on every attempt, and the
+    // password is hashed by the same pre-save hook either way.
+    await User.create([{
+      _id: userId, name: payload.name, email: payload.email, password: payload.password,
+      account_code: accountCode
+    }], { session });
+    await licenceSvc.claim(licence._id, userId, payload.email, { session });
+    await require('./masters.service').seedDefaultCatalog(userId, { session });
+  };
+  const undoPartialAccount = async () => {
+    await licenceSvc.releaseForUser(userId).catch(() => {});
+    for (const name of ['GasType', 'GasCapacity', 'CylinderSize']) {
+      await require(`../models/${name}`).deleteMany({ user_id: userId });
     }
-  }
+    await User.deleteOne({ _id: userId });
+  };
+  await require('../utils/transactions').runAsOneUnit(createAccount, undoPartialAccount);
+
+  const user = await User.findById(userId);
 
   try {
     await require('./trustedPeople.service').createBootstrap(user._id, { name: user.name, email: user.email });

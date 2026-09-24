@@ -25,8 +25,8 @@ describe('naive bill_date is interpreted as IST, not UTC', () => {
     const user = await User.create({ name: 'TZ', email: 'tz@test.com', password: 'Test1234!' });
     uid = user._id;
     await LocationProfile.create([{ user_id: uid, location: CH, manager_name: 'Raju' }]);
-    gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-    size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
+    gas = await GasType.create({ user_id: uid, gas_type_name: 'Oxygen', is_active: true });
+    size = await CylinderSize.create({ user_id: uid, size_label: '7 m3', is_active: true });
     cust = await Customer.create({ user_id: uid, company_name: 'TZ Co', phone_primary: '9', holding_limit: 50 });
     await cylSvc.createCylinder(uid, { rotational_number: 'Z1', gas_type: 'Oxygen', capacity: '7 m3', location: CH, stock_state: 'IN_STOCK' });
   });

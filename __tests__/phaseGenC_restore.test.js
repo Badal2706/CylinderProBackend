@@ -2,7 +2,6 @@
 //
 // The end-to-end run against the actual production-copy backup lives in a scratchpad script; this
 // is the part that must never regress silently, so it lives in the suite: the refusals.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const fs = require('fs');
 const os = require('os');
@@ -41,10 +40,10 @@ function fileRes(filePath) {
 async function makeSourceAccount() {
   const GasType = require('../models/GasType');
   const CylinderSize = require('../models/CylinderSize');
-  await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-  await CylinderSize.create({ size_label: '7 m3', is_active: true });
 
   const u = await User.create({ name: 'Source', email: 'source@restore.test', password: 'Test1234!' });
+  await GasType.create({ user_id: u._id, gas_type_name: 'Oxygen', is_active: true });
+  await CylinderSize.create({ user_id: u._id, size_label: '7 m3', is_active: true });
   await User.collection.updateOne({ _id: u._id }, { $set: { account_code: N.deriveAccountCode(u._id) } });
   await LocationProfile.create({ user_id: u._id, location: CH, label: 'Chandisar Plant', is_filling_location: true });
   await BusinessProfile.create({ user_id: u._id, business_name: 'Source Gases' });
@@ -57,8 +56,8 @@ async function makeSourceAccount() {
   // A bill whose line item references the catalogs BY ID — the thing that broke.
   const GasType2 = require('../models/GasType');
   const CylinderSize2 = require('../models/CylinderSize');
-  const gas = await GasType2.findOne({ gas_type_name: 'Oxygen' }).lean();
-  const size = await CylinderSize2.findOne({ size_label: '7 m3' }).lean();
+  const gas = await GasType2.findOne({ user_id: u._id, gas_type_name: 'Oxygen' }).lean();
+  const size = await CylinderSize2.findOne({ user_id: u._id, size_label: '7 m3' }).lean();
   await Bill.create({
     user_id: u._id, customer_id: cust._id, bill_number: '1A001', bill_date: new Date('2026-06-15T10:00:00+05:30'),
     challan_no: 'C-1', location: CH, transaction_type: 'GIVEN', transaction_category: 'CUSTOMER',
@@ -213,10 +212,10 @@ describe('restoring into an empty account', () => {
     const billSvc = require('../services/bill.service');
 
     const cust = await Customer.findOne({ user_id: target._id }).lean();
-    const gas = await GasType.findOne({ gas_type_name: 'Oxygen' }).lean()
-      || await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-    const size = await CylinderSize.findOne({ size_label: '7 m3' }).lean()
-      || await CylinderSize.create({ size_label: '7 m3', is_active: true });
+    const gas = await GasType.findOne({ user_id: target._id, gas_type_name: 'Oxygen' }).lean()
+      || await GasType.create({ user_id: target._id, gas_type_name: 'Oxygen', is_active: true });
+    const size = await CylinderSize.findOne({ user_id: target._id, size_label: '7 m3' }).lean()
+      || await CylinderSize.create({ user_id: target._id, size_label: '7 m3', is_active: true });
 
     const before = await Bill.countDocuments({ user_id: target._id });
     const suggested = await billSvc.generateBillNumber(target._id);
@@ -326,21 +325,18 @@ describe('catalogs that a fresh install has already seeded under different ids',
     await RestoreJob.deleteMany({});
     acct._clearCache();
 
-    // Exactly what booting against an empty database produces: the same NAMES, brand-new ids.
-    const GasType = require('../models/GasType');
-    const CylinderSize = require('../models/CylinderSize');
-    await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-    await CylinderSize.create({ size_label: '7 m3', is_active: true });
-
     target = await User.create({ name: 'Seeded', email: 'seeded@restore.test', password: 'Test1234!' });
     target.account_code = N.deriveAccountCode(target._id);
     await target.save();
+    // Exactly what signup gives a new account: its own catalog — the same NAMES the archive uses,
+    // under brand-new ids.
+    await require('../services/masters.service').seedDefaultCatalog(target._id);
     acct._clearCache();
   });
 
   test('the archive\'s catalogs replace the seeded ones, ids and all', async () => {
     const GasType = require('../models/GasType');
-    const seededId = String((await GasType.findOne({ gas_type_name: 'Oxygen' }).lean())._id);
+    const seededId = String((await GasType.findOne({ user_id: target._id, gas_type_name: 'Oxygen' }).lean())._id);
 
     const p = await restore.previewRestore(target._id, fs.createReadStream(zipPath));
     expect(p.can_restore).toBe(true);
@@ -358,9 +354,11 @@ describe('catalogs that a fresh install has already seeded under different ids',
     expect(st.mismatches.filter(m => /already exists with a different id/.test(m))).toEqual([]);
     expect(st.mismatches).toEqual([]);
 
-    const oxy = await GasType.findOne({ gas_type_name: 'Oxygen' }).lean();
+    const oxy = await GasType.findOne({ user_id: target._id, gas_type_name: 'Oxygen' }).lean();
     expect(String(oxy._id)).not.toBe(seededId);              // the archive's id won
-    expect(await GasType.countDocuments({ gas_type_name: 'Oxygen' })).toBe(1);  // not duplicated
+    expect(await GasType.countDocuments({ user_id: target._id, gas_type_name: 'Oxygen' })).toBe(1);  // not duplicated
+    // and the seeded defaults the archive does not carry are gone, not left mixed in
+    expect(await GasType.countDocuments({ user_id: target._id })).toBe(1);
   });
 
   test('and every restored bill\'s catalog reference actually resolves', async () => {
@@ -374,11 +372,11 @@ describe('catalogs that a fresh install has already seeded under different ids',
       for (const li of (b.line_items || [])) {
         if (li.gas_type_id) {
           checked++;
-          expect(await GasType.exists({ _id: li.gas_type_id })).toBeTruthy();
+          expect(await GasType.exists({ _id: li.gas_type_id, user_id: target._id })).toBeTruthy();
         }
         if (li.cylinder_size_id) {
           checked++;
-          expect(await CylinderSize.exists({ _id: li.cylinder_size_id })).toBeTruthy();
+          expect(await CylinderSize.exists({ _id: li.cylinder_size_id, user_id: target._id })).toBeTruthy();
         }
       }
     }
@@ -505,11 +503,24 @@ describe('a restore that fails part-way undoes itself', () => {
     expect(st.counts_written.customers).toBeGreaterThan(0);
     expect(st.counts_written.cylinders).toBeGreaterThan(0);
 
-    // THE POINT: the account is empty again, so it can still be restored into.
+    // THE POINT: the account is empty again, so it can still be restored into — holding exactly
+    // what a fresh signup leaves: nothing but its default gas/size catalog. The rollback puts that
+    // back because nothing re-creates a catalog lazily, and an account without one has empty
+    // dropdowns (catalogs are per-account since 24 Sep 2026).
+    const { GAS_CAPACITIES } = require('../config/gasCapacities');
+    const DEFAULTS = {
+      gastypes: Object.keys(GAS_CAPACITIES).length,
+      gascapacities: Object.keys(GAS_CAPACITIES).length,
+      cylindersizes: new Set(Object.values(GAS_CAPACITIES).flat()).size
+    };
     for (const spec of backup.COLLECTIONS.filter(c => c.scope === 'user')) {
       const n = await require(`../models/${spec.model}`).countDocuments({ user_id: victim._id });
-      expect([spec.key, n]).toEqual([spec.key, 0]);
+      expect([spec.key, n]).toEqual([spec.key, DEFAULTS[spec.key] || 0]);
     }
+    // …and it is the DEFAULT catalog, not a leftover of the archive's
+    const GasType = require('../models/GasType');
+    expect((await GasType.find({ user_id: victim._id }).lean()).map(g => g.gas_type_name).sort())
+      .toEqual(Object.keys(GAS_CAPACITIES).sort());
 
     // And it says what it removed.
     expect(st.mismatches.some(m => /Rolled back/.test(m))).toBe(true);
@@ -610,7 +621,10 @@ describe('signup assigns the permanent account code', () => {
     const raw = await User.create({ name: 'Raw', email: 'raw@restore.test', password: 'Test1234!' });
     expect(raw.account_code).toBe('');
 
+    // The signup path derives it from the id it is about to create (see licence.test.js for the
+    // behavioural check through the real signup flow).
     const authSrc = fs.readFileSync(path.join(__dirname, '..', 'services', 'auth.service.js'), 'utf8');
-    expect(authSrc).toMatch(/user\.account_code\s*=\s*require\('\.\/numbering\.service'\)\.deriveAccountCode\(user\._id\)/);
+    expect(authSrc).toMatch(/const accountCode = require\('\.\/numbering\.service'\)\.deriveAccountCode\(userId\)/);
+    expect(authSrc).toMatch(/account_code: accountCode/);
   });
 });

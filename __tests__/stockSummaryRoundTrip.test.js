@@ -20,7 +20,6 @@
 // Nothing here hardcodes a site name. The two sites are distinguished only by
 // `is_filling_location`, which is what the report code actually keys on — so a client with
 // different sites, or three of them, gets the same behaviour.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 
@@ -81,8 +80,8 @@ beforeAll(async () => {
     { user_id: user._id, location: PLANT, label: 'Works Alpha', is_filling_location: true },
     { user_id: user._id, location: OFFICE, label: 'Depot Beta' }
   ]);
-  gas = await GasType.create({ gas_type_name: GAS, is_active: true });
-  size = await CylinderSize.create({ size_label: CAP, is_active: true });
+  gas = await GasType.create({ user_id: user._id, gas_type_name: GAS, is_active: true });
+  size = await CylinderSize.create({ user_id: user._id, size_label: CAP, is_active: true });
   customer = await Customer.create({
     user_id: user._id, company_name: 'Round Trip Co', customer_type: 'REGULAR',
     phone_primary: '9000000000', is_active: true, holding_limit: 99

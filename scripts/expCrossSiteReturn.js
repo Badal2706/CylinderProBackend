@@ -10,7 +10,6 @@
 //   C  cross-site return + auto transfer (the proposal)
 //
 // Nothing here touches the real database.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'exp-salt';
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const mongoose = require('mongoose');
@@ -42,8 +41,8 @@ async function build(world) {
     { user_id: u._id, location: CH, label: 'Chandisar Plant', is_filling_location: true },
     { user_id: u._id, location: PA, label: 'Palanpur Office' }
   ]);
-  const gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-  const size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
+  const gas = await GasType.create({ user_id: u._id, gas_type_name: 'Oxygen', is_active: true });
+  const size = await CylinderSize.create({ user_id: u._id, size_label: '7 m3', is_active: true });
   const cust = await Customer.create({ user_id: u._id, company_name: 'Exp Customer', customer_type: 'REGULAR', phone_primary: '9', is_active: true, holding_limit: 99 });
 
   // One cylinder, starting in stock at Palanpur.

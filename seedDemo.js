@@ -95,14 +95,14 @@ const SEED_TXNS = process.env.SEED_TXNS === 'true';
   }
   console.log('🧹 Cleared demo data:', JSON.stringify(cleared));
 
-  // ── Ensure master gas types + sizes exist; map name/label → ObjectId ──
+  // ── Ensure the demo account's own gas types + sizes exist; map name/label → ObjectId ──
   const gasId = {}, sizeId = {};
   for (const gas of Object.keys(GAS_CAPACITIES)) {
-    const g = await GasType.findOneAndUpdate({ gas_type_name: gas }, { gas_type_name: gas, is_active: true }, { upsert: true, new: true });
+    const g = await GasType.findOneAndUpdate({ user_id: uid, gas_type_name: gas }, { user_id: uid, gas_type_name: gas, is_active: true }, { upsert: true, new: true });
     gasId[gas] = g._id;
   }
   for (const cap of [...new Set(Object.values(GAS_CAPACITIES).flat())]) {
-    const s = await CylinderSize.findOneAndUpdate({ size_label: cap }, { size_label: cap, is_active: true }, { upsert: true, new: true });
+    const s = await CylinderSize.findOneAndUpdate({ user_id: uid, size_label: cap }, { user_id: uid, size_label: cap, is_active: true }, { upsert: true, new: true });
     sizeId[cap] = s._id;
   }
 

@@ -11,7 +11,6 @@
 // 5.5 hours on one set to UTC. Same code, different answer depending on where it runs — so the
 // tests below assert the helper's output as absolute UTC instants, which pins the behaviour on
 // every machine rather than agreeing with whatever this one happens to be set to.
-process.env.NUMBERING_SALT = process.env.NUMBERING_SALT || 'test-salt-do-not-use-in-production';
 
 const mongoose = require('mongoose');
 
@@ -100,8 +99,8 @@ describe('a bill entered just after midnight IST', () => {
     acct._clearCache();
 
     await LocationProfile.create([{ user_id: user._id, location: PLANT, label: 'Works', is_filling_location: true }]);
-    gas = await GasType.create({ gas_type_name: GAS, is_active: true });
-    size = await CylinderSize.create({ size_label: CAP, is_active: true });
+    gas = await GasType.create({ user_id: user._id, gas_type_name: GAS, is_active: true });
+    size = await CylinderSize.create({ user_id: user._id, size_label: CAP, is_active: true });
     customer = await Customer.create({
       user_id: user._id, company_name: 'Night Shift Ltd', customer_type: 'REGULAR',
       phone_primary: '9000000000', is_active: true, holding_limit: 99

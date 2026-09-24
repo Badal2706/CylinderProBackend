@@ -35,7 +35,6 @@ const HEARTBEAT_MS = 2000;
 
 const tmpDir = () => path.join(os.tmpdir(), 'cylinderpro-restore');
 const userScoped = () => backup.COLLECTIONS.filter(c => c.scope === 'user');
-const globalScoped = () => backup.COLLECTIONS.filter(c => c.scope === 'global');
 
 // "Empty account" means no BUSINESS data — not literally no documents.
 //
@@ -55,8 +54,6 @@ const BUSINESS_KEYS = [
 const businessScoped = () => userScoped().filter(c => BUSINESS_KEYS.includes(c.key));
 const configScoped = () => userScoped().filter(c => !BUSINESS_KEYS.includes(c.key));
 
-// The unique business field for each shared catalog — how a merge decides "already present".
-const GLOBAL_KEY = { gastypes: 'gas_type_name', gascapacities: 'gas_type_name', cylindersizes: 'size_label' };
 
 const modelOf = (spec) => require(`../models/${spec.model}`);
 
@@ -324,45 +321,6 @@ async function restoreUserCollection(job, spec, entry, userId, accountCode) {
   return written;
 }
 
-// Shared catalogs have no user_id, and bill line items reference them BY _id (gas_type_id,
-// cylinder_size_id) — so they must come back with the SAME _id or every restored bill points at
-// a gas type that does not exist here.
-//
-// config/mongodb.js upserts a default catalog on EVERY BOOT, so a fresh install already holds
-// "Oxygen", "7 m3" and the rest under freshly minted ids. Merging by name therefore left the
-// archive's ids unused and every restored bill dangling. The catalogs are replaced wholesale
-// instead — they are seeded defaults, exactly like the location profiles, and the archive is
-// authoritative. Safe because a restore refuses outright if any OTHER account owns data here,
-// so nothing else in this database can be referencing them.
-async function clearGlobalCatalogs() {
-  const removed = {};
-  for (const spec of globalScoped()) {
-    const r = await modelOf(spec).deleteMany({});
-    if (r.deletedCount) removed[spec.key] = r.deletedCount;
-  }
-  return removed;
-}
-
-async function restoreGlobalCollection(spec, entry, mismatches) {
-  const Model = modelOf(spec);
-  const keyField = GLOBAL_KEY[spec.key];
-  let written = 0;
-
-  for await (const doc of readDocs(entry)) {
-    try {
-      await Model.collection.insertOne(doc);
-      written++;
-    } catch (e) {
-      if (e.code !== 11000) throw e;
-      // The catalog was cleared first, so a duplicate here means the ARCHIVE itself carries two
-      // entries under one name. Worth reporting rather than swallowing.
-      mismatches.push(
-        `${spec.key}: the backup contains more than one "${keyField ? doc[keyField] : doc._id}" — kept the first.`);
-    }
-  }
-  return written;
-}
-
 // Undo a partial restore. Safe ONLY because the account was verified empty before writing, which
 // is checked once more here rather than assumed.
 async function rollback(userId) {
@@ -371,6 +329,10 @@ async function rollback(userId) {
     const r = await modelOf(spec).deleteMany({ user_id: userId });
     if (r.deletedCount) removed[spec.key] = r.deletedCount;
   }
+  // The account's catalog was cleared before writing and the archive's copy has just been removed,
+  // so it now has none — and nothing re-creates one lazily, unlike location profiles. Put back the
+  // defaults a fresh signup gets, so a failed restore leaves an account that still works.
+  await require('./masters.service').seedDefaultCatalog(userId);
   return removed;
 }
 
@@ -403,14 +365,13 @@ async function runRestore(jobId) {
 
     // Clear the account's default configuration so the archive's copies insert cleanly. A fresh
     // account is seeded with location profiles carrying the SAME codes the backup uses, which
-    // would otherwise collide on the unique (user_id, location) index part-way through.
+    // would otherwise collide on the unique (user_id, location) index part-way through — and with
+    // its own gas/size catalog, whose default names collide on (user_id, gas_type_name) and whose
+    // freshly minted ids are not the ones the archive's bills reference. The archive's catalog,
+    // with its original _ids (R120), replaces it wholesale.
     const clearedCfg = await clearConfiguration(userId);
     if (Object.keys(clearedCfg).length) {
       logger.info(`restore ${job._id}: replaced default configuration ${JSON.stringify(clearedCfg)}`);
-    }
-    const clearedCat = await clearGlobalCatalogs();
-    if (Object.keys(clearedCat).length) {
-      logger.info(`restore ${job._id}: replaced boot-seeded catalogs ${JSON.stringify(clearedCat)}`);
     }
 
     // Adopt the backup's account code so every restored bill_uid matches what was exported.
@@ -429,9 +390,7 @@ async function runRestore(jobId) {
       });
       if (!entry) { countsWritten[spec.key] = 0; continue; }
 
-      countsWritten[spec.key] = spec.scope === 'global'
-        ? await restoreGlobalCollection(spec, entry, mismatches)
-        : await restoreUserCollection(job, spec, entry, userId, accountCode);
+      countsWritten[spec.key] = await restoreUserCollection(job, spec, entry, userId, accountCode);
 
       done += countsWritten[spec.key];
       await RestoreJob.updateOne({ _id: job._id }, { $set: { 'progress.done': done } });
@@ -442,12 +401,9 @@ async function runRestore(jobId) {
     for (const spec of backup.COLLECTIONS) {
       const declared = (manifest.counts || {})[spec.key];
       if (declared === undefined) continue;
-      const actual = await modelOf(spec).countDocuments(
-        spec.scope === 'user' ? { user_id: userId } : {});
-      if (spec.scope === 'user' && actual !== declared) {
+      const actual = await modelOf(spec).countDocuments({ user_id: userId });
+      if (actual !== declared) {
         mismatches.push(`${spec.key}: expected ${declared}, found ${actual} after restore.`);
-      } else if (spec.scope === 'global' && actual < declared) {
-        mismatches.push(`${spec.key}: expected at least ${declared}, found ${actual}.`);
       }
     }
 
@@ -461,10 +417,10 @@ async function runRestore(jobId) {
     const missingRefs = new Set();
     for (const b of sample) {
       for (const li of (b.line_items || [])) {
-        if (li.gas_type_id && !(await GasType.exists({ _id: li.gas_type_id }))) {
+        if (li.gas_type_id && !(await GasType.exists({ _id: li.gas_type_id, user_id: userId }))) {
           missingRefs.add(`gas type ${li.gas_type_id} (${li.gas_type_name || '?'})`);
         }
-        if (li.cylinder_size_id && !(await CylinderSize.exists({ _id: li.cylinder_size_id }))) {
+        if (li.cylinder_size_id && !(await CylinderSize.exists({ _id: li.cylinder_size_id, user_id: userId }))) {
           missingRefs.add(`size ${li.cylinder_size_id} (${li.size_label || '?'})`);
         }
       }
@@ -475,7 +431,7 @@ async function runRestore(jobId) {
         [...missingRefs].slice(0, 5).join(', ') + (missingRefs.size > 5 ? ' …' : ''));
     }
 
-    if (mismatches.filter(m => !m.startsWith('gastypes') && !m.startsWith('gascapacities') && !m.startsWith('cylindersizes')).length) {
+    if (mismatches.length) {
       throw new HttpError(500, 'Restore finished with count mismatches:\n' + mismatches.join('\n'));
     }
 

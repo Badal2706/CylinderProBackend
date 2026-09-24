@@ -39,8 +39,8 @@ describe('Phase 35 — added-to-transfer timing', () => {
     const user = await User.create({ name: 'P35', email: 'p35@test.com', password: 'Test1234!' });
     uid = user._id;
     await LocationProfile.create([{ user_id: uid, location: CH, manager_name: 'Raju' }, { user_id: uid, location: PA, manager_name: 'Manish' }]);
-    gas = await GasType.create({ gas_type_name: 'Oxygen', is_active: true });
-    size = await CylinderSize.create({ size_label: '7 m3', is_active: true });
+    gas = await GasType.create({ user_id: uid, gas_type_name: 'Oxygen', is_active: true });
+    size = await CylinderSize.create({ user_id: uid, size_label: '7 m3', is_active: true });
     cust = await Customer.create({ user_id: uid, company_name: 'Acme', phone_primary: '9', holding_limit: 100 });
   });
 
