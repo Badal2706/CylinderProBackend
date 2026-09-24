@@ -126,6 +126,21 @@ exports.restoreStatus = asyncHandler(async (req, res) => {
   res.json(await restoreService.getRestoreStatus(req.user.id, req.params.jobId));
 });
 
+// R162: the account's restore state, and the two ways back to normal use.
+exports.restoreState = asyncHandler(async (req, res) => {
+  res.json(await restoreService.getRestoreState(req.user.id));
+});
+
+exports.cancelPendingRestore = asyncHandler(async (req, res) => {
+  res.json(await profileService.cancelPendingRestore(req.user.id, req.body.password,
+    req.headers['x-step-up-token'] || req.body.step_up_token));
+});
+
+exports.recoverUnfinishedRestore = asyncHandler(async (req, res) => {
+  res.json(await profileService.recoverUnfinishedRestore(req.user.id, req.body.password,
+    req.headers['x-step-up-token'] || req.body.step_up_token, req.body.action));
+});
+
 // Phase GEN-C: the full-fidelity BACKUP, not the XLSX report export below. Same streaming
 // error handling: headers are already sent once the archive starts, so a mid-stream failure
 // cannot be turned into a JSON error response.

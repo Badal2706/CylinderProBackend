@@ -32,6 +32,38 @@ const backup = require('./backup.service');
 const BATCH = 500;                      // documents per bulkWrite
 const STAGE_TTL_MS = 30 * 60 * 1000;    // an unconfirmed upload is swept after 30 minutes
 const HEARTBEAT_MS = 2000;
+// R162: how long a RUNNING job's heartbeat may stay silent before the job is taken for dead.
+// Set from measurement, not guessed (25 Sep 2026, full production copy, restores driven through the
+// real API while another tenant's traffic ran against the same server; heartbeat age sampled every
+// 50 ms from outside): the OLDEST heartbeat a check could ever have seen was 1.04 s restoring the
+// production-size backup (36,340 records, 4 s), 1.04 s for a 10x-history backup (275,056 records,
+// 20 s), and 1.15 s for that 10x backup with the server pinned to one core and MongoDB capped at one
+// CPU (28 s). The heartbeat ticks every 2 s and on every 500-document batch. Two minutes is about
+// 100x the worst gap measured. The margin costs nothing: a restore running in THIS process is never
+// reaped at all (activeJobs), and after a restart every orphan is interrupted at once without
+// waiting (interruptOrphansAtBoot) -- this threshold only ever decides for a job some OTHER process
+// was running.
+const DEAD_AFTER_MS = 2 * 60 * 1000;
+
+// Jobs this process is running right now. A job in here is alive by definition and is never
+// taken for dead, however quiet its heartbeat — the heartbeat rule exists for jobs this process
+// cannot see (a process that died, or another instance if the server is ever clustered).
+const activeJobs = new Set();
+
+// Thrown by a running job that finds its own job document is no longer RUNNING — something else
+// declared it dead and may already be clearing the account. It stops writing at once and touches
+// nothing else: no rollback, no status change.
+const takenOver = () => Object.assign(new Error('This restore was marked as stopped while it was still running.'),
+  { code: 'RESTORE_TAKEN_OVER' });
+
+// Update the job's progress/heartbeat, but only while it is still RUNNING.
+async function touchJob(jobId, update) {
+  const r = await RestoreJob.updateOne({ _id: jobId, status: 'RUNNING' }, update);
+  if (!r.matchedCount) throw takenOver();
+}
+
+const setRestoreState = (userId, state) =>
+  User.updateOne({ _id: userId }, { $set: { restore_state: state } });
 
 const tmpDir = () => path.join(os.tmpdir(), 'cylinderpro-restore');
 const userScoped = () => backup.COLLECTIONS.filter(c => c.scope === 'user');
@@ -255,6 +287,7 @@ async function validate(userId, byName, manifest) {
 
 async function previewRestore(userId, req) {
   await sweepStale();
+  await reapDeadJobs();
   const zipPath = await stageUpload(userId, req);
 
   try {
@@ -304,7 +337,7 @@ async function restoreUserCollection(job, spec, entry, userId, accountCode) {
     await Model.collection.insertMany(ops, { ordered: false });
     written += ops.length;
     ops = [];
-    await RestoreJob.updateOne({ _id: job._id }, {
+    await touchJob(job._id, {
       $set: { 'progress.written': written, heartbeat_at: new Date() },
       $inc: { 'progress.done': 0 }
     });
@@ -320,8 +353,8 @@ async function restoreUserCollection(job, spec, entry, userId, accountCode) {
   return written;
 }
 
-// Undo a partial restore. Safe ONLY because the account was verified empty before writing, which
-// is checked once more here rather than assumed.
+// Undo a partial restore. Safe ONLY because the account was verified empty before writing — and
+// only ever called once writing has actually begun (see `writeStarted` in runRestore).
 async function rollback(userId) {
   const removed = {};
   for (const spec of [...userScoped()].reverse()) {
@@ -343,8 +376,9 @@ async function runRestore(jobId) {
   const accountCode = manifest.account_code || '';
   const total = Object.values(manifest.counts || {}).reduce((a, b) => a + b, 0);
 
+  activeJobs.add(String(job._id));
   const heartbeat = setInterval(() => {
-    RestoreJob.updateOne({ _id: job._id }, { $set: { heartbeat_at: new Date() } }).catch(() => {});
+    RestoreJob.updateOne({ _id: job._id, status: 'RUNNING' }, { $set: { heartbeat_at: new Date() } }).catch(() => {});
   }, HEARTBEAT_MS);
 
   const countsWritten = {};
@@ -352,6 +386,11 @@ async function runRestore(jobId) {
   let done = 0;
 
   let writing = '';                       // the collection being written, for the failure message
+  // Set the moment this job first changes the account. Before that point a failure has written
+  // nothing, so there is nothing to roll back — and rolling back anyway would delete whatever the
+  // account holds, which is exactly the data the "no longer empty" refusal below is protecting.
+  let writeStarted = false;
+  let priorState = 'none';
   try {
     const { byName } = await openArchive(job.zip_path);
 
@@ -363,6 +402,15 @@ async function runRestore(jobId) {
         'The account is no longer empty (' + existing.join(', ') + '). Nothing was restored. ' +
         'Empty it first — Settings → Data & Privacy → Danger Zone → Empty This Account (download its backup before you do) — then restore into the emptied account.');
     }
+
+    // R162: from here on the account is being written. Mark it, so every other write to it is
+    // refused until this finishes, and so a crash from here on is visible as an unfinished restore.
+    // The state it had is kept on the job, so a clean failure can put it back.
+    const me = await User.findById(userId).select('restore_state').lean();
+    priorState = (me && me.restore_state) || 'none';
+    await touchJob(job._id, { $set: { prior_state: priorState } });
+    writeStarted = true;
+    await setRestoreState(userId, 'restore_in_progress');
 
     // Clear the account's default configuration so the archive's copies insert cleanly. A fresh
     // account is seeded with location profiles carrying the SAME codes the backup uses, which
@@ -386,7 +434,7 @@ async function runRestore(jobId) {
     for (const spec of backup.COLLECTIONS) {
       writing = spec.key;
       const entry = byName.get(`${spec.key}.ejsonl`);
-      await RestoreJob.updateOne({ _id: job._id }, {
+      await touchJob(job._id, {
         $set: { 'progress.collection': spec.key, 'progress.written': 0, 'progress.total': total,
                 'progress.done': done, heartbeat_at: new Date() }
       });
@@ -395,7 +443,7 @@ async function runRestore(jobId) {
       countsWritten[spec.key] = await restoreUserCollection(job, spec, entry, userId, accountCode);
 
       done += countsWritten[spec.key];
-      await RestoreJob.updateOne({ _id: job._id }, { $set: { 'progress.done': done } });
+      await touchJob(job._id, { $set: { 'progress.done': done } });
     }
 
     // Every collection is counted back out of the database and compared with the manifest. A
@@ -438,7 +486,11 @@ async function runRestore(jobId) {
     }
 
     clearInterval(heartbeat);
-    await RestoreJob.updateOne({ _id: job._id }, {
+    // The account is complete and verified: back to normal use first, then the job is closed. (A
+    // crash between the two leaves a complete account in normal use and a job that is later
+    // marked INTERRUPTED — harmless. The other order could offer to clear a finished restore.)
+    await setRestoreState(userId, 'none');
+    await RestoreJob.updateOne({ _id: job._id, status: 'RUNNING' }, {
       $set: { status: 'DONE', counts_written: countsWritten, mismatches, finished_at: new Date() },
       $unset: { lock_key: '' }
     });
@@ -446,16 +498,30 @@ async function runRestore(jobId) {
     logger.info(`restore ${job._id} completed for user ${userId}: ${done} documents`);
   } catch (err) {
     clearInterval(heartbeat);
+    if (err && err.code === 'RESTORE_TAKEN_OVER') {
+      // Declared dead by someone else while still alive. Whoever did that now owns the account's
+      // recovery; touching the job or the account from here could undo their work.
+      logger.error(`restore ${job._id} stopped: its job was marked as no longer running (R162)`);
+      return;
+    }
     logger.error(`restore ${job._id} failed: ${err.stack || err.message}`);
     let status = 'FAILED';
     let removed = {};
-    try {
-      removed = await rollback(userId);
-    } catch (rbErr) {
-      status = 'ROLLBACK_FAILED';
-      logger.error(`restore ${job._id} ROLLBACK FAILED: ${rbErr.stack || rbErr.message}`);
+    if (writeStarted) {
+      try {
+        removed = await rollback(userId);
+        // Rolled back cleanly: the account is empty again, with the default catalog. It returns
+        // to the state it had before this job began (a fresh signup to normal use, an emptied
+        // account to waiting-for-a-restore).
+        await setRestoreState(userId, priorState);
+      } catch (rbErr) {
+        status = 'ROLLBACK_FAILED';
+        // restore_state stays restore_in_progress: the account holds partial data, and Settings
+        // offers to clear it (R162).
+        logger.error(`restore ${job._id} ROLLBACK FAILED: ${rbErr.stack || rbErr.message}`);
+      }
     }
-    await RestoreJob.updateOne({ _id: job._id }, {
+    await RestoreJob.updateOne({ _id: job._id, status: 'RUNNING' }, {
       $set: {
         status,
         error: explainFailure(err, writing),
@@ -467,7 +533,80 @@ async function runRestore(jobId) {
       $unset: { lock_key: '' }
     });
     await fs.promises.unlink(job.zip_path).catch(() => {});
+  } finally {
+    activeJobs.delete(String(job._id));
   }
+}
+
+// ─────────────────────────── dead jobs (R162) ───────────────────────────
+
+// A RUNNING job that no process is running any more. Left alone it holds the ONE restore lock —
+// shared by every account in the database, so no tenant could restore again — and it makes Empty
+// This Account refuse ("a restore is running") forever. It is marked INTERRUPTED and the lock is
+// released. The account it was writing into keeps restore_state = restore_in_progress, which is
+// what makes Settings offer "Try again" / "Remove the partial data".
+//
+// Dead means: not running in this process AND silent for longer than DEAD_AFTER_MS. The update is
+// conditional on the very heartbeat that was read, so a job that ticks in between is left alone.
+async function reapDeadJobs(filter = {}) {
+  const cutoff = new Date(Date.now() - DEAD_AFTER_MS);
+  const running = await RestoreJob.find({ ...filter, status: 'RUNNING' })
+    .select('_id user_id heartbeat_at started_at').lean();
+  let reaped = 0;
+  for (const j of running) {
+    if (activeJobs.has(String(j._id))) continue;
+    const last = j.heartbeat_at || j.started_at;
+    if (last && last > cutoff) continue;
+    const r = await RestoreJob.updateOne({ _id: j._id, status: 'RUNNING', heartbeat_at: j.heartbeat_at }, {
+      $set: {
+        status: 'INTERRUPTED', finished_at: new Date(),
+        error: 'The server stopped while this restore was writing. Nothing more will be written. ' +
+          'Settings → Data & Privacy offers to try again or to remove the partial data.'
+      },
+      $unset: { lock_key: '' }
+    });
+    if (r.modifiedCount) {
+      reaped++;
+      logger.warn(`restore ${j._id} (user ${j.user_id}) marked INTERRUPTED: no heartbeat since ${last && last.toISOString()}`);
+    }
+  }
+  return reaped;
+}
+
+// At startup this process is running no restore, so every RUNNING job belongs to a process that
+// has died (a crash, a deploy restart mid-restore). All of them are interrupted at once, without
+// waiting out DEAD_AFTER_MS. Correct for the single pm2 process this server runs as; if it is ever
+// clustered, drop this and rely on reapDeadJobs alone, which respects other live instances.
+async function interruptOrphansAtBoot() {
+  const r = await RestoreJob.updateMany({ status: 'RUNNING' }, {
+    $set: {
+      status: 'INTERRUPTED', finished_at: new Date(),
+      error: 'The server restarted while this restore was writing. Nothing more will be written. ' +
+        'Settings → Data & Privacy offers to try again or to remove the partial data.'
+    },
+    $unset: { lock_key: '' }
+  });
+  if (r.modifiedCount) logger.warn(`startup: ${r.modifiedCount} unfinished restore(s) marked INTERRUPTED`);
+  return r.modifiedCount;
+}
+
+// Where the account stands, for Settings and the app-wide banner.
+async function getRestoreState(userId) {
+  await reapDeadJobs({ user_id: userId });
+  const me = await User.findById(userId).select('restore_state').lean();
+  const state = (me && me.restore_state) || 'none';
+  const live = await RestoreJob.findOne({ user_id: userId, status: 'RUNNING' }).select('_id').lean();
+  const last = state === 'none' ? null : await RestoreJob
+    .findOne({ user_id: userId, status: { $in: ['RUNNING', 'DONE', 'FAILED', 'ROLLBACK_FAILED', 'INTERRUPTED'] } })
+    .sort({ createdAt: -1 }).select('status error started_at finished_at').lean();
+  return {
+    restore_state: state,
+    running_job_id: live ? String(live._id) : null,
+    // written into, and nothing is writing any more: the case Settings offers to clear
+    unfinished: state === 'restore_in_progress' && !live,
+    last_job: last ? { status: last.status, error: last.error || '', started_at: last.started_at,
+      finished_at: last.finished_at } : null
+  };
 }
 
 // A duplicate-key failure is the database refusing to write a record whose _id (or unique key)
@@ -500,6 +639,9 @@ async function confirmRestore(userId, restoreToken) {
     throw new HttpError(400, 'The uploaded file is no longer available. Upload the backup again.');
   }
 
+  // A dead job would still hold the lock; release it first (R162).
+  await reapDeadJobs();
+
   // Take the lock. The unique partial index means exactly one job can hold it.
   try {
     await RestoreJob.updateOne({ _id: job._id }, {
@@ -519,6 +661,7 @@ async function confirmRestore(userId, restoreToken) {
 }
 
 async function getRestoreStatus(userId, jobId) {
+  await reapDeadJobs({ user_id: userId });
   const job = await RestoreJob.findOne({ _id: jobId, user_id: userId })
     .select('status progress counts_written mismatches error started_at finished_at manifest').lean()
     .catch(() => null);
@@ -556,7 +699,13 @@ module.exports = {
   previewRestore,
   confirmRestore,
   getRestoreStatus,
+  getRestoreState,
   sweepStale,
+  reapDeadJobs,
+  interruptOrphansAtBoot,
+  setRestoreState,
+  DEAD_AFTER_MS,
   // exported for tests
-  validate, findExistingData, findCodeHolder, rollback, runRestore, openArchive, readManifest
+  validate, findExistingData, findCodeHolder, rollback, runRestore, openArchive, readManifest,
+  _activeJobs: activeJobs
 };

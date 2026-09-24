@@ -12,7 +12,8 @@ const connectDB = async () => {
 
     logger.info(`MongoDB connected (db: ${mongoose.connection.name}, host: ${mongoose.connection.host})`);
 
-    // Boot writes nothing. It used to upsert one global gas/size catalog on every start; since
+    // Boot writes no business data (the only boot write is server.js marking dead restore jobs,
+    // R162). It used to upsert one global gas/size catalog on every start; since
     // 24 Sep 2026 each account owns its own catalog, written once at signup
     // (services/masters.service.seedDefaultCatalog).
   } catch (error) {

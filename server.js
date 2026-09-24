@@ -71,8 +71,11 @@ app.use(mongoSanitize);
 // to cluster mode / multiple instances, the in-memory counters become per-process and must be
 // backed by a shared store (Redis) — flag before switching.
 
-// Connect to MongoDB
-connectDB();
+// Connect to MongoDB. The one thing boot then writes: any restore job still marked RUNNING died
+// with the previous process, so it is marked INTERRUPTED and its lock released (R162).
+connectDB()
+  .then(() => require('./services/restore.service').interruptOrphansAtBoot())
+  .catch(err => logger.error(`startup restore check failed: ${err.stack || err.message}`));
 
 // --- Health check (mounted before rate limiting so monitors aren't throttled) ---
 app.get('/api/health', (req, res) => {

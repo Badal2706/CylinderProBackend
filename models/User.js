@@ -26,6 +26,20 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  // R162: where this account stands between "emptied for a restore" and "restore finished".
+  //   none                   — normal use (every account, always, unless one of the two below)
+  //   empty_pending_restore  — Empty This Account ran; waiting for a backup to be restored or for
+  //                            the owner to cancel. New business records are refused meanwhile.
+  //   restore_in_progress    — a restore has started writing (or died while writing). Every change
+  //                            to the account is refused until it finishes or is cleared.
+  // Written ONLY by Empty This Account, a restore starting/finishing, and the cancel/recovery
+  // actions in Settings → Data & Privacy. Never by signup (which just takes the default). An
+  // account created before 25 Sep 2026 has no field at all, which reads as 'none'.
+  restore_state: {
+    type: String,
+    enum: ['none', 'empty_pending_restore', 'restore_in_progress'],
+    default: 'none'
+  },
   last_login: { type: Date },
   // Incremented by "Log Out All Sessions" — any JWT issued with an older value is rejected.
   token_version: { type: Number, default: 0 },

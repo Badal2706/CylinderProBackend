@@ -1,9 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
+const { blockChangesWhileRestoring } = require('../middleware/restoreGate');
 const ctrl = require('../controllers/trusted-people.controller');
 
 router.use(authMiddleware);
+// R162: nothing changes while a restore is writing into this account.
+router.use(blockChangesWhileRestoring());
 
 // Trusted People CRUD (Phase 17). Adding sends an email OTP; the person activates on
 // verification. Edit/remove will be step-up-gated in Phase 18.

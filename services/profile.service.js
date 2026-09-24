@@ -88,7 +88,12 @@ async function getLocationProfiles(userId) {
   const existing = await LocationProfile.find({ user_id: userId });
 
   // All-or-nothing on purpose: an account with ANY registry is left exactly as it is.
-  if (!existing.length) {
+  // R162: and never while a restore is writing — it has just cleared this account's locations and
+  // is about to insert the backup's, which carry the same codes; a seeded default would collide
+  // with them on (user_id, location) and fail the restore. Opening Settings mid-restore just shows
+  // no locations until it finishes.
+  if (!existing.length &&
+      ((await User.findById(userId).select('restore_state').lean()) || {}).restore_state !== 'restore_in_progress') {
     try {
       existing.push(await LocationProfile.create({
         user_id: userId,
@@ -809,6 +814,8 @@ async function emptyAccountForRestore(userId, password, stepUpToken) {
       'your way back if the restore does not go as planned. Then empty the account within 30 minutes.');
   }
 
+  // A restore that died mid-write would otherwise look "running" here forever (R162).
+  await require('./restore.service').reapDeadJobs({ user_id: userId });
   const running = await require('../models/RestoreJob')
     .findOne({ user_id: userId, status: 'RUNNING' }).select('_id').lean();
   if (running) throw new HttpError(409, 'A restore into this account is running. Wait for it to finish.');
@@ -816,6 +823,9 @@ async function emptyAccountForRestore(userId, password, stepUpToken) {
   const removed = await purgeAccountData(userId);
   await require('./masters.service').seedDefaultCatalog(userId);
   require('./accountNumbering.service')._clearCache();
+  // R162: emptied, waiting for a backup. New business records are refused until the restore
+  // finishes or the owner cancels (Settings → Data & Privacy).
+  await require('./restore.service').setRestoreState(userId, 'empty_pending_restore');
 
   // Recorded AFTER the purge (which removes the audit log with everything else), and logged on the
   // server too — the next restore replaces the audit log with the backup's.
@@ -828,6 +838,80 @@ async function emptyAccountForRestore(userId, password, stepUpToken) {
 
   return {
     message: 'This account is now empty. Restore your backup into it from Settings → Data & Privacy.',
+    removed
+  };
+}
+
+// ─── R162: the two ways out of a non-normal restore state ───
+//
+// Both are gated exactly like Empty This Account — the password AND an owner-only approval — and
+// live in the same place in Settings. Neither asks for a fresh backup: in the first case the
+// account is already empty, and in the second a backup would only capture half-restored data.
+
+// Emptied, but the owner decided not to restore after all. The account is already empty (with the
+// default catalog Empty This Account put back), so there is nothing to undo: it simply returns to
+// normal use.
+async function cancelPendingRestore(userId, password, stepUpToken) {
+  const user = await User.findById(userId);
+  if (!user) throw new HttpError(404, 'User not found');
+  if (!password || !(await user.comparePassword(password))) {
+    throw new HttpError(400, 'Incorrect password');
+  }
+  const approval = await require('./stepup.service').requireOwnerStepUp(userId, stepUpToken, 'Cancelling the restore');
+  if ((user.restore_state || 'none') !== 'empty_pending_restore') {
+    throw new HttpError(409, 'This account is not waiting for a restore, so there is nothing to cancel.');
+  }
+  await require('./restore.service').setRestoreState(userId, 'none');
+  await require('./audit.service').record({
+    userId, action: 'RESTORE_CANCEL', target: 'Whole account',
+    detail: 'Emptied account returned to normal use without restoring a backup', stepUp: approval
+  });
+  require('../logger').info(`account ${userId}: pending restore cancelled`);
+  return { message: 'Cancelled. The account is empty and ready for normal use.', restore_state: 'none' };
+}
+
+// A restore began writing and never finished (the server stopped, or its own rollback failed), so
+// the account holds an unknown part of a backup. There is NO resuming from where it stopped: the
+// account is always purged in full first — the same purge Empty This Account uses — which also
+// guarantees no half-written catalog is left to collide with (and no duplicate gas types or sizes).
+//   action 'retry'   → empty, waiting for the backup to be uploaded again (empty_pending_restore)
+//   action 'discard' → empty with the default catalog, back to normal use (none)
+async function recoverUnfinishedRestore(userId, password, stepUpToken, action) {
+  if (!['retry', 'discard'].includes(action)) {
+    throw new HttpError(400, 'Choose whether to try the restore again or to remove the partial data.');
+  }
+  const user = await User.findById(userId);
+  if (!user) throw new HttpError(404, 'User not found');
+  if (!password || !(await user.comparePassword(password))) {
+    throw new HttpError(400, 'Incorrect password');
+  }
+  const approval = await require('./stepup.service').requireOwnerStepUp(userId, stepUpToken, 'Clearing an unfinished restore');
+  if ((user.restore_state || 'none') !== 'restore_in_progress') {
+    throw new HttpError(409, 'There is no unfinished restore on this account.');
+  }
+  const restoreService = require('./restore.service');
+  await restoreService.reapDeadJobs({ user_id: userId });
+  const running = await require('../models/RestoreJob')
+    .findOne({ user_id: userId, status: 'RUNNING' }).select('_id').lean();
+  if (running) throw new HttpError(409, 'A restore into this account is still running. Wait for it to finish.');
+
+  const removed = await purgeAccountData(userId);
+  await require('./masters.service').seedDefaultCatalog(userId);
+  require('./accountNumbering.service')._clearCache();
+  const next = action === 'retry' ? 'empty_pending_restore' : 'none';
+  await restoreService.setRestoreState(userId, next);
+
+  await require('./audit.service').record({
+    userId, action: 'ACCOUNT_PURGE', target: 'Whole account',
+    detail: `Cleared an unfinished restore (${action === 'retry' ? 'to try again' : 'partial data removed'}): ${JSON.stringify(removed)}`,
+    stepUp: approval
+  });
+  require('../logger').warn(`account ${userId}: unfinished restore cleared (${action}): ${JSON.stringify(removed)}`);
+  return {
+    message: action === 'retry'
+      ? 'The partial data was removed. Upload the backup again to restore it.'
+      : 'The partial data was removed. The account is empty and ready for normal use.',
+    restore_state: next,
     removed
   };
 }
@@ -996,6 +1080,8 @@ async function exportData(userId, res) {
 module.exports = {
   purgeAccountData,
   emptyAccountForRestore,
+  cancelPendingRestore,
+  recoverUnfinishedRestore,
   getAccount,
   updateAccount,
   changePassword,

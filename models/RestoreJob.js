@@ -25,6 +25,7 @@ const restoreJobSchema = new mongoose.Schema({
       'DONE',
       'FAILED',       // stopped part-way; whatever it wrote has been rolled back
       'ROLLBACK_FAILED', // could not undo its own partial write — needs a human
+      'INTERRUPTED',  // the server died while it was writing (R162); cleared from Settings
       'CANCELLED',
       'EXPIRED'       // staged, never confirmed, temp file cleaned up
     ],
@@ -56,7 +57,10 @@ const restoreJobSchema = new mongoose.Schema({
   started_at: { type: Date, default: null },
   finished_at: { type: Date, default: null },
   // Bumped as the job writes. A RUNNING job whose heartbeat has gone quiet has died.
-  heartbeat_at: { type: Date, default: null }
+  heartbeat_at: { type: Date, default: null },
+  // R162: the account's restore_state when this job began writing, so a failure that rolled back
+  // cleanly can put the account back exactly where it was.
+  prior_state: { type: String, default: '' }
 }, { timestamps: true });
 
 // One active restore at a time, enforced by the database.

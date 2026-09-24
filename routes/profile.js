@@ -2,11 +2,19 @@ const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
 const { requireStepUpAuth, stepUpGate } = require('../middleware/stepUp');
+const { blockChangesWhileRestoring } = require('../middleware/restoreGate');
 const validate = require('../middleware/validate');
 const V = require('../validators/schemas');
 const ctrl = require('../controllers/profile.controller');
 
 router.use(authMiddleware);
+// R162: while a restore is writing into this account (or died while writing), nothing here may
+// change it. Reads stay open, except the backup download, which writes a BACKUP_TAKEN audit row
+// the restore's final count check would trip over. The recovery actions below stay reachable.
+router.use(blockChangesWhileRestoring({
+  allow: ['POST /verify-password', 'POST /logout-all', 'POST /restore-recovery'],
+  alsoBlock: ['GET /backup']
+}));
 
 router.get('/', ctrl.getAccount);
 // Phase 20: Account Information saves are step-up-gated like every other Profile section.
@@ -56,5 +64,11 @@ router.get('/backup', ctrl.exportBackup);
 router.post('/restore/preview', stepUpGate('Restoring from a backup'), ctrl.restorePreview);
 router.post('/restore/confirm', stepUpGate('Restoring from a backup'), ctrl.restoreConfirm);
 router.get('/restore/status/:jobId', ctrl.restoreStatus);
+// R162: where the account stands (normal / emptied, waiting for a restore / restore in progress or
+// unfinished), and the two ways out. Both need the password AND an owner-only approval, exactly
+// like Empty This Account, and both are enforced in the service.
+router.get('/restore-state', ctrl.restoreState);
+router.post('/restore-cancel', ctrl.cancelPendingRestore);
+router.post('/restore-recovery', ctrl.recoverUnfinishedRestore);
 
 module.exports = router;

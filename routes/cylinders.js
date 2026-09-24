@@ -1,12 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
+const { blockCreateWhileRestoring: noNew, blockChangesWhileRestoring } = require('../middleware/restoreGate');
 const { stepUpGate } = require('../middleware/stepUp');
 const validate = require('../middleware/validate');
 const V = require('../validators/schemas');
 const ctrl = require('../controllers/cylinders.controller');
 
 router.use(authMiddleware);
+// R162: nothing changes while a restore is writing into this account.
+router.use(blockChangesWhileRestoring());
 
 // NOTE: '/aging-report' and '/in-rotation' MUST stay declared before '/:id',
 // or they would be captured as an :id param.
@@ -20,8 +23,8 @@ router.get('/:id/history', ctrl.getCylinderHistory);
 // caller is not re-prompted per page. MUST stay above '/:id' or it is captured as an :id param.
 router.get('/:id/history/full', stepUpGate('Viewing the full history'), ctrl.getCylinderHistoryPage);
 router.get('/:id', ctrl.getCylinder);
-router.post('/', validate(V.cylinderCreate), ctrl.createCylinder);
-router.post('/import', validate(V.importRows), ctrl.importCylinders);
+router.post('/', noNew, validate(V.cylinderCreate), ctrl.createCylinder);
+router.post('/import', noNew, validate(V.importRows), ctrl.importCylinders);
 router.post('/:id/maintenance', ctrl.setMaintenance);
 router.put('/:id', validate(V.cylinderUpdate), ctrl.updateCylinder);
 router.delete('/:id', ctrl.deleteCylinder);

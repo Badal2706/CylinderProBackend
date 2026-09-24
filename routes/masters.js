@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
+const { blockChangesWhileRestoring } = require('../middleware/restoreGate');
 const { stepUpGate } = require('../middleware/stepUp');
 const ctrl = require('../controllers/masters.controller');
 
@@ -8,6 +9,8 @@ const ctrl = require('../controllers/masters.controller');
 // caller's catalog only. Until then these were global, reads were public, and a mutation needed
 // only SOME account's step-up token — so one tenant could change another's catalog.
 router.use(authMiddleware);
+// R162: nothing changes while a restore is writing into this account.
+router.use(blockChangesWhileRestoring());
 
 // Mutations still need a verified step-up approval (Phase 18), now bound to the signed-in account.
 // The label keeps the refusal message word-for-word what it was.

@@ -582,7 +582,8 @@ describe('only one restore can run at a time', () => {
     expect(p.can_restore).toBe(true);          // proves nothing else can be the reason
 
     const holder = await RestoreJob.create({
-      user_id: new mongoose.Types.ObjectId(), status: 'RUNNING', lock_key: 'RESTORE'
+      // a LIVE holder: another process, heartbeat fresh (R162 would reap a silent one as dead)
+      user_id: new mongoose.Types.ObjectId(), status: 'RUNNING', lock_key: 'RESTORE', heartbeat_at: new Date()
     });
 
     await expect(restore.confirmRestore(clean._id, p.restore_token))

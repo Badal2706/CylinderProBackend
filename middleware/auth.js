@@ -18,7 +18,8 @@ module.exports = async (req, res, next) => {
   }
   try {
     // Validate the token against the user's current token_version (supports "log out all").
-    const user = await User.findById(payload.id).select('token_version sessions');
+    // restore_state rides along on the same read, for middleware/restoreGate.js (R162).
+    const user = await User.findById(payload.id).select('token_version sessions restore_state');
     if (!user) {
       return res.status(401).json({ error: 'Account no longer exists.', code: 'NO_USER' });
     }
@@ -42,6 +43,7 @@ module.exports = async (req, res, next) => {
       }
     }
     req.user = payload;
+    req.restoreState = user.restore_state || 'none';   // no field (pre-R162 account) = none
     next();
   } catch (err) {
     res.status(500).json({ error: 'Authentication check failed.' });

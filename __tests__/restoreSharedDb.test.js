@@ -171,7 +171,7 @@ describe('emptying the account is its own gated step', () => {
 
   test('while a restore into this account is running it is refused', async () => {
     jest.spyOn(stepup, 'requireOwnerStepUp').mockResolvedValue({ via: 'OTP', person_id: null, person_name: 'Owner' });
-    const job = await RestoreJob.create({ user_id: A._id, status: 'RUNNING' });
+    const job = await RestoreJob.create({ user_id: A._id, status: 'RUNNING', heartbeat_at: new Date() });
     try {
       await expect(profileSvc.emptyAccountForRestore(A._id, 'Test1234!', 'ok')).rejects.toThrow(/restore into this account is running/i);
     } finally { await RestoreJob.deleteOne({ _id: job._id }); }

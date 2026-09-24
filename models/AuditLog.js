@@ -11,7 +11,7 @@ const auditLogSchema = new mongoose.Schema({
   action: {
     type: String,
     enum: ['BILL_EDIT', 'BILL_DELETE', 'OVER_LIMIT_OVERRIDE', 'PROFILE_SAVE', 'MASTERS_CHANGE',
-           'TRUSTED_PEOPLE_CHANGE', 'BACKUP_TAKEN', 'ACCOUNT_PURGE'],
+           'TRUSTED_PEOPLE_CHANGE', 'BACKUP_TAKEN', 'ACCOUNT_PURGE', 'RESTORE_CANCEL'],
     required: true
   },
   target: { type: String, default: '' },  // e.g. bill number, section name, gas type
