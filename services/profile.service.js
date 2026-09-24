@@ -758,6 +758,80 @@ async function logoutAll(userId) {
   return { message: 'All sessions logged out' };
 }
 
+// Every record of this account that a backup carries, removed — scoped by user_id, nothing else.
+//
+// The list is DERIVED from backup.service.COLLECTIONS — the same list the backup and restore
+// paths walk. It used to be hand-written inside deleteAccount and had silently fallen behind:
+// CylinderHistory, Counter and RestoreJob were all missed, so a deleted account left thousands of
+// orphaned history rows and its bill counter behind. Deriving it means a new collection cannot be
+// forgotten again. Shared by deleteAccount and emptyAccountForRestore, so the two cannot drift.
+async function purgeAccountData(userId) {
+  const removed = {};
+  for (const spec of require('./backup.service').COLLECTIONS.filter(c => c.scope === 'user')) {
+    const r = await require(`../models/${spec.model}`).deleteMany({ user_id: userId });
+    if (r.deletedCount) removed[spec.model] = r.deletedCount;
+  }
+  return removed;
+}
+
+// How recently the account's backup must have been downloaded before it may be emptied.
+const PURGE_BACKUP_WINDOW_MS = 30 * 60 * 1000;
+
+// ─── Empty this account so a backup can be restored into it (R161) ───
+//
+// A restore never overwrites: it loads only into an account holding no business data. An account
+// that has data therefore needs this step first — a separate, deliberate action, never part of a
+// restore. It is Wipe & Replace (RULES.md §17), gated the same way:
+//   · the password AND an owner-only step-up approval, exactly like deleting the account;
+//   · a backup of this account downloaded within the last 30 minutes — the way back if the restore
+//     that follows does not go as planned (checked against the BACKUP_TAKEN audit row the download
+//     writes, so it holds even if the page is bypassed);
+//   · refused while a restore of this account is running.
+// It removes every record a backup carries and nothing else: the login, sessions, trusted people
+// and the licence stay. The default gas/size catalog is put back afterwards, so the account is
+// left exactly as a fresh signup leaves it rather than with empty dropdowns.
+async function emptyAccountForRestore(userId, password, stepUpToken) {
+  const user = await User.findById(userId);
+  if (!user) throw new HttpError(404, 'User not found');
+  // 400 (not 401) — a wrong password must never trigger the client's expired-session auto-logout.
+  if (!password || !(await user.comparePassword(password))) {
+    throw new HttpError(400, 'Incorrect password');
+  }
+  const approval = await require('./stepup.service').requireOwnerStepUp(userId, stepUpToken, 'Emptying the account');
+
+  const AuditLog = require('../models/AuditLog');
+  const recent = await AuditLog.findOne({
+    user_id: userId, action: 'BACKUP_TAKEN', createdAt: { $gte: new Date(Date.now() - PURGE_BACKUP_WINDOW_MS) }
+  }).select('_id').lean();
+  if (!recent) {
+    throw new HttpError(400,
+      'Download this account\'s backup first (Settings → Data & Privacy → Download Backup). It is ' +
+      'your way back if the restore does not go as planned. Then empty the account within 30 minutes.');
+  }
+
+  const running = await require('../models/RestoreJob')
+    .findOne({ user_id: userId, status: 'RUNNING' }).select('_id').lean();
+  if (running) throw new HttpError(409, 'A restore into this account is running. Wait for it to finish.');
+
+  const removed = await purgeAccountData(userId);
+  await require('./masters.service').seedDefaultCatalog(userId);
+  require('./accountNumbering.service')._clearCache();
+
+  // Recorded AFTER the purge (which removes the audit log with everything else), and logged on the
+  // server too — the next restore replaces the audit log with the backup's.
+  await require('./audit.service').record({
+    userId, action: 'ACCOUNT_PURGE', target: 'Whole account',
+    detail: `Emptied before a restore: ${JSON.stringify(removed)}`,
+    stepUp: approval               // who approved, and how (OTP / TOTP)
+  });
+  require('../logger').warn(`account ${userId} emptied for restore: ${JSON.stringify(removed)}`);
+
+  return {
+    message: 'This account is now empty. Restore your backup into it from Settings → Data & Privacy.',
+    removed
+  };
+}
+
 // Phase 21: deletion needs BOTH the password AND an owner-only step-up approval — several
 // people may know the shared password, but only the bootstrap owner can authorize this.
 async function deleteAccount(userId, password, stepUpToken) {
@@ -769,19 +843,10 @@ async function deleteAccount(userId, password, stepUpToken) {
   }
   await require('./stepup.service').requireOwnerStepUp(userId, stepUpToken, 'Deleting the account');
 
-  // The purge list is DERIVED from backup.service.COLLECTIONS — the same list the backup and
-  // restore paths walk — plus the login/approval records a backup deliberately excludes. It used
-  // to be hand-written here, and had silently fallen behind: CylinderHistory, Counter and
-  // RestoreJob were all missed, so a deleted account left thousands of orphaned history rows and
-  // its bill counter behind. Deriving it means a new collection cannot be forgotten again.
-  const backupSvc = require('./backup.service');
-  const targets = backupSvc.COLLECTIONS
-    .filter(c => c.scope === 'user')
-    .map(c => c.model)
-    .concat(['TrustedPerson', 'OtpToken', 'RestoreJob']);
-
-  const removed = {};
-  for (const name of targets) {
+  // Everything a backup carries (purgeAccountData), plus the login/approval records a backup
+  // deliberately excludes.
+  const removed = await purgeAccountData(userId);
+  for (const name of ['TrustedPerson', 'OtpToken', 'RestoreJob']) {
     const r = await require(`../models/${name}`).deleteMany({ user_id: userId });
     if (r.deletedCount) removed[name] = r.deletedCount;
   }
@@ -929,6 +994,8 @@ async function exportData(userId, res) {
 }
 
 module.exports = {
+  purgeAccountData,
+  emptyAccountForRestore,
   getAccount,
   updateAccount,
   changePassword,

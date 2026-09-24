@@ -34,6 +34,8 @@ router.patch('/active-location', ctrl.setActiveLocation);
 router.post('/verify-password', ctrl.verifyPassword);
 router.post('/logout-all', ctrl.logoutAll);
 router.delete('/delete-account', ctrl.deleteAccount);
+// R161: the explicit, separate step that lets a backup be restored into an account that has data.
+router.post('/empty-account', ctrl.emptyAccountForRestore);
 router.get('/export-data', ctrl.exportData);
 // Phase GEN-C: the disaster-recovery backup.
 //

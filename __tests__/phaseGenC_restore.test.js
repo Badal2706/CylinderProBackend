@@ -132,9 +132,9 @@ describe('restoring into an empty account', () => {
 
   beforeAll(async () => {
     // A restore models DISASTER RECOVERY: the server is gone and this is a fresh install. The
-    // source account cannot still be sitting in the target database — the "this database belongs
-    // to another account" guard would (correctly) refuse, which is exactly what the refusal tests
-    // below assert. So wipe first, exactly as a new deployment would start.
+    // source account cannot still be sitting in the target database holding its account code — the
+    // "another live account uses this backup's code" check would (correctly) refuse, which is what
+    // the refusal tests below assert (R161). So wipe first, exactly as a new deployment would start.
     for (const spec of backup.COLLECTIONS) {
       await require(`../models/${spec.model}`).deleteMany({});
     }
@@ -394,20 +394,26 @@ describe('the refusals — these are the whole safety story', () => {
     const p = await restore.previewRestore(u._id, fs.createReadStream(zipPath));
     expect(p.can_restore).toBe(false);
     expect(p.problems.some(x => /already contains data/i.test(x))).toBe(true);
+    // …and it says exactly what to do instead (R161): empty the account first, as its own step.
+    expect(p.needs_purge).toBe(true);
+    expect(p.problems.some(x => /Empty This Account/.test(x))).toBe(true);
 
     // And there is no way to push past it.
     await expect(restore.confirmRestore(u._id, p.restore_token))
       .rejects.toThrow(/did not pass validation/i);
   });
 
-  test('a database that belongs to another account is refused', async () => {
+  test('a backup whose account code another live account still uses is refused up front', async () => {
     const u = await User.create({ name: 'Fresh', email: 'fresh@restore.test', password: 'Test1234!' });
     u.account_code = N.deriveAccountCode(u._id);
     await u.save();
-    // This account is empty, but the database is not — `source` owns data here.
+    // This account is empty. Other accounts owning data here no longer matters (R161) — but
+    // `source`, whose backup this is, still holds its account code, so restoring here would give
+    // two accounts one bill-number series.
     const p = await restore.previewRestore(u._id, fs.createReadStream(zipPath));
     expect(p.can_restore).toBe(false);
-    expect(p.problems.some(x => /another account/i.test(x))).toBe(true);
+    expect(p.needs_purge).toBe(false);
+    expect(p.problems.some(x => /another account in this\s+database still uses/i.test(x))).toBe(true);
   });
 
   test('a zip that is not a backup is rejected with a message naming the likely mistake', async () => {

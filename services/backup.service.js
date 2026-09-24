@@ -133,6 +133,10 @@ async function buildManifest(userId) {
     // under pressure — and the one that silently destroys data. The codes will not match, and
     // the restore refuses before writing anything.
     account_code: user.account_code || '',
+    // The source account's id. Traceability only — a restore always loads into the SIGNED-IN
+    // account and never looks this up (R161): after a disaster the source account usually no
+    // longer exists, and the account restoring is a fresh signup with an id of its own.
+    account_id: String(user._id),
     account_email: user.email,
     account_name: user.name,
     account_created_at: user.createdAt,

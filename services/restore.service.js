@@ -165,21 +165,15 @@ async function clearConfiguration(userId) {
   return removed;
 }
 
-// Is this database already somebody else's? Restoring client A's archive into client B's live
-// database is the disaster-recovery failure most likely to actually happen, and the only one that
-// silently destroys data that was fine a moment ago.
-async function findOtherAccounts(userId) {
-  const others = await User.find({ _id: { $ne: userId } }).select('_id email account_code').lean();
-  const owners = [];
-  for (const o of others) {
-    for (const spec of userScoped()) {
-      if (await modelOf(spec).countDocuments({ user_id: o._id })) {
-        owners.push(`${o.email}${o.account_code ? ` (${o.account_code})` : ''}`);
-        break;
-      }
-    }
-  }
-  return owners;
+// Does another LIVE account already use this backup's account code? Then restoring here would
+// give two accounts one bill-number series. The unique index on users.account_code would refuse it
+// anyway (R153) — but only mid-restore, after this account's settings were cleared — so it is
+// checked up front instead: one indexed lookup. This is the realistic way a restore meets another
+// tenant (the backup's own account is still in the database); it replaces the old whole-database
+// refusal, which blocked ANY other account's presence (R161).
+async function findCodeHolder(userId, accountCode) {
+  if (!accountCode) return null;
+  return User.findOne({ account_code: accountCode, _id: { $ne: userId } }).select('email').lean();
 }
 
 // Read the archive, check everything that can be checked, and WRITE NOTHING.
@@ -204,13 +198,15 @@ async function validate(userId, byName, manifest) {
     }
   }
 
-  // 3. the target account must be empty
+  // 3. THE precondition (R161): this account — the signed-in one, by its own user_id, never by
+  // email or account code — holds no business data. Other accounts in the database are irrelevant.
   const existing = await findExistingData(userId);
-  if (existing.length) {
+  const needsPurge = existing.length > 0;
+  if (needsPurge) {
     problems.push(
-      'This account already contains data (' + existing.join(', ') + '). A restore can only load ' +
-      'into an account with no customers, cylinders, bills, payments or history — create a new ' +
-      'account and restore into that.');
+      'This account already contains data (' + existing.join(', ') + '). A restore only loads into ' +
+      'an account with no customers, cylinders, bills, payments or history, and never overwrites. ' +
+      'Empty it first — Settings → Data & Privacy → Danger Zone → Empty This Account (download its backup before you do) — then restore into the emptied account.');
   }
 
   // Configuration that WILL be replaced. Not a problem, but the operator should know it goes.
@@ -226,12 +222,13 @@ async function validate(userId, byName, manifest) {
       'restore is meant to overwrite.');
   }
 
-  // 4. the database must not belong to someone else
-  const others = await findOtherAccounts(userId);
-  if (others.length) {
+  // 4. the backup's account code must not belong to another live account (see findCodeHolder)
+  const holder = await findCodeHolder(userId, manifest.account_code);
+  if (holder) {
     problems.push(
-      'This database already holds business data for another account (' + others.join(', ') + '). ' +
-      'Restoring here would mix two clients together. Each client must have its own database.');
+      `This backup belongs to account code ${manifest.account_code}, which another account in this ` +
+      `database still uses (${holder.email}). Restoring it here would give two accounts the same ` +
+      'bill and receipt series. Restore it into that account instead, after emptying it.');
   }
 
   // 5. the account code the restored records will carry
@@ -251,7 +248,7 @@ async function validate(userId, byName, manifest) {
     'Trusted People, your password and two-factor setup are NOT part of a backup and will not be ' +
     'restored. Set them up again once the restore finishes.');
 
-  return { ok: problems.length === 0, problems, warnings, actual_counts: actual };
+  return { ok: problems.length === 0, problems, warnings, actual_counts: actual, needs_purge: needsPurge };
 }
 
 // ─────────────────────────── preview ───────────────────────────
@@ -272,6 +269,8 @@ async function previewRestore(userId, req) {
     return {
       restore_token: String(job._id),
       can_restore: validation.ok,
+      // true when the only way forward is emptying this account first — the page offers that step
+      needs_purge: validation.needs_purge,
       problems: validation.problems,
       warnings: validation.warnings,
       manifest: {
@@ -352,6 +351,7 @@ async function runRestore(jobId) {
   const mismatches = [];
   let done = 0;
 
+  let writing = '';                       // the collection being written, for the failure message
   try {
     const { byName } = await openArchive(job.zip_path);
 
@@ -360,7 +360,8 @@ async function runRestore(jobId) {
     const existing = await findExistingData(userId);
     if (existing.length) {
       throw new HttpError(409,
-        'The account is no longer empty (' + existing.join(', ') + '). Nothing was restored.');
+        'The account is no longer empty (' + existing.join(', ') + '). Nothing was restored. ' +
+        'Empty it first — Settings → Data & Privacy → Danger Zone → Empty This Account (download its backup before you do) — then restore into the emptied account.');
     }
 
     // Clear the account's default configuration so the archive's copies insert cleanly. A fresh
@@ -383,6 +384,7 @@ async function runRestore(jobId) {
     }
 
     for (const spec of backup.COLLECTIONS) {
+      writing = spec.key;
       const entry = byName.get(`${spec.key}.ejsonl`);
       await RestoreJob.updateOne({ _id: job._id }, {
         $set: { 'progress.collection': spec.key, 'progress.written': 0, 'progress.total': total,
@@ -456,7 +458,7 @@ async function runRestore(jobId) {
     await RestoreJob.updateOne({ _id: job._id }, {
       $set: {
         status,
-        error: err.message,
+        error: explainFailure(err, writing),
         counts_written: countsWritten,
         mismatches: mismatches.concat(
           Object.keys(removed).length ? [`Rolled back: ${JSON.stringify(removed)}`] : []),
@@ -466,6 +468,22 @@ async function runRestore(jobId) {
     });
     await fs.promises.unlink(job.zip_path).catch(() => {});
   }
+}
+
+// A duplicate-key failure is the database refusing to write a record whose _id (or unique key)
+// already exists — that is the safety net against colliding with another account's data, and it is
+// the default: MongoDB never overwrites on insert. It is reported in words, because the raw driver
+// message ("E11000 duplicate key error collection ...") tells an operator nothing. Anything else is
+// passed through unchanged.
+function explainFailure(err, writing) {
+  const dup = err && (err.code === 11000 || (err.writeErrors || []).some(w => w.code === 11000) ||
+    /E11000 duplicate key/.test(err.message || ''));
+  if (!dup) return err.message;
+  const where = writing ? ` (while writing ${writing})` : '';
+  return 'A record in this backup already exists in this database under the same internal id' + where +
+    ' — it belongs to another account. MongoDB refuses a duplicate id, so nothing of theirs was ' +
+    'touched, and this restore has been rolled back. It means this backup\'s records are already ' +
+    'present in this database; restore it into the account they belong to. [' + String(err.message).slice(0, 200) + ']';
 }
 
 // ─────────────────────────── confirm / status ───────────────────────────
@@ -540,5 +558,5 @@ module.exports = {
   getRestoreStatus,
   sweepStale,
   // exported for tests
-  validate, findExistingData, findOtherAccounts, rollback, runRestore, openArchive, readManifest
+  validate, findExistingData, findCodeHolder, rollback, runRestore, openArchive, readManifest
 };

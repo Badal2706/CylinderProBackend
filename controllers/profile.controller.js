@@ -98,6 +98,13 @@ exports.logoutAll = asyncHandler(async (req, res) => {
   res.json(await profileService.logoutAll(req.user.id));
 });
 
+// R161: empty the account so a backup can be restored into it. Password + owner-only step-up, and
+// a backup of this account taken within 30 minutes — all enforced in the service.
+exports.emptyAccountForRestore = asyncHandler(async (req, res) => {
+  res.json(await profileService.emptyAccountForRestore(req.user.id, req.body.password,
+    req.headers['x-step-up-token'] || req.body.step_up_token));
+});
+
 exports.deleteAccount = asyncHandler(async (req, res) => {
   // Phase 21: password + owner-only step-up approval, both enforced in the service.
   res.json(await profileService.deleteAccount(req.user.id, req.body.password,
